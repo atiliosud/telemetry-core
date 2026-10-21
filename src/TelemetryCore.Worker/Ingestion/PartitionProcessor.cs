@@ -104,7 +104,7 @@ public sealed partial class PartitionProcessor
         }
         finally
         {
-            ArrayPool<TelemetryEvent>.Shared.Return(buffer);
+            ArrayPool<TelemetryEvent>.Shared.Return(buffer, clearArray: true); // drop string references
         }
     }
 
@@ -202,7 +202,7 @@ public sealed partial class PartitionProcessor
         }
         finally
         {
-            ArrayPool<Guid>.Shared.Return(ids);
+            ArrayPool<Guid>.Shared.Return(ids, clearArray: true);
         }
     }
 
@@ -224,7 +224,7 @@ public sealed partial class PartitionProcessor
         }
         finally
         {
-            ArrayPool<Guid>.Shared.Return(ids);
+            ArrayPool<Guid>.Shared.Return(ids, clearArray: true);
         }
     }
 

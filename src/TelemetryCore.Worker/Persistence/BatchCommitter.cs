@@ -24,6 +24,9 @@ public sealed class BatchCommitter : IBatchCommitter
         _cache = cache;
     }
 
+    /// <summary>Commits the batch transaction. Test seam: lets tests simulate an ambiguous commit (committed, then a failure reported).</summary>
+    internal Func<NpgsqlTransaction, CancellationToken, Task> CommitTransactionAsync { get; init; } = static (tx, ct) => tx.CommitAsync(ct);
+
     public async Task<PersistResult> CommitAsync(ReadOnlyMemory<TelemetryEvent> events, int partition, CancellationToken ct)
     {
         if (events.IsEmpty)
@@ -31,6 +34,22 @@ public sealed class BatchCommitter : IBatchCommitter
             return new PersistResult(0, 0, 0, 0, Array.Empty<SpeedingAlertMessage>());
         }
 
+        try
+        {
+            return await CommitCoreAsync(events, partition, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The outcome may be unknown (e.g. COMMIT reached Postgres but the reply was lost). A retry would then see
+            // no new ids and never publish, so drop the cached state of every vehicle in the batch: the next attempt
+            // reloads the truth from vehicle_state.
+            EvictVehicles(events.Span);
+            throw;
+        }
+    }
+
+    private async Task<PersistResult> CommitCoreAsync(ReadOnlyMemory<TelemetryEvent> events, int partition, CancellationToken ct)
+    {
         await using var conn = await _dataSource.OpenConnectionAsync(ct).ConfigureAwait(false);
         await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
 
@@ -67,15 +86,23 @@ public sealed class BatchCommitter : IBatchCommitter
 
             await _repository.UpsertStatesAsync(conn, tx, touched.Values, ct).ConfigureAwait(false);
             await _repository.InsertAlertsAndOutboxAsync(conn, tx, outcome.Alerts, ct).ConfigureAwait(false);
-            await tx.CommitAsync(ct).ConfigureAwait(false);
+            await CommitTransactionAsync(tx, ct).ConfigureAwait(false);
             _cache.Publish(touched.Values);
         }
         else
         {
-            await tx.CommitAsync(ct).ConfigureAwait(false);
+            await CommitTransactionAsync(tx, ct).ConfigureAwait(false);
         }
 
         return new PersistResult(outcome.Inserted, outcome.Duplicates, outcome.OutOfOrderIds?.Count ?? 0, outcome.GpsJumps, outcome.Alerts);
+    }
+
+    private void EvictVehicles(ReadOnlySpan<TelemetryEvent> events)
+    {
+        for (var i = 0; i < events.Length; i++)
+        {
+            _cache.Evict(events[i].VehicleId);
+        }
     }
 
     /// <summary>Clones cached state for every vehicle of a new event; returns the vehicles that must be loaded from the DB.</summary>

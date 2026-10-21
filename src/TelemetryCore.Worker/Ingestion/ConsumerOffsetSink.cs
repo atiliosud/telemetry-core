@@ -28,6 +28,11 @@ public sealed partial class ConsumerOffsetSink : IOffsetSink
             // committed offset and the DB key makes the replay idempotent (D1).
             LogStoreFailed(_log, ex, partition, nextOffset);
         }
+        catch (ObjectDisposedException ex)
+        {
+            // A processor aborted after a shutdown drain timeout finished after the consumer was closed.
+            LogStoreFailed(_log, ex, partition, nextOffset);
+        }
     }
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Could not store offset {NextOffset} for partition {Partition}; it will be replayed by the partition owner")]

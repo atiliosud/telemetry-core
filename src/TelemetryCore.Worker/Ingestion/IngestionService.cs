@@ -20,6 +20,7 @@ public sealed partial class IngestionService : BackgroundService
     internal static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(15);
 
     private static readonly TimeSpan ConsumeTimeout = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan ConsumeErrorBackoff = TimeSpan.FromMilliseconds(500);
 
     private readonly WorkerOptions _options;
     private readonly IBatchCommitter _committer;
@@ -70,6 +71,7 @@ public sealed partial class IngestionService : BackgroundService
                 catch (ConsumeException ex)
                 {
                     LogConsumeError(_log, ex, ex.Error.Reason);
+                    await Task.Delay(ConsumeErrorBackoff, _clock, stoppingToken).ConfigureAwait(false); // avoid a log flood
                     continue;
                 }
 
@@ -111,6 +113,8 @@ public sealed partial class IngestionService : BackgroundService
             EnableAutoOffsetStore = false,
             AutoOffsetReset = AutoOffsetReset.Earliest,
             PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky,
+            // Deliberate (D11): a DB outage longer than this stalls the loop on a full channel and triggers a rebalance.
+            MaxPollIntervalMs = 300_000,
         };
 
         return new ConsumerBuilder<string, byte[]>(config)
