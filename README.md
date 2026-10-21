@@ -11,7 +11,7 @@ A fleet sends position and speed events continuously. The pipeline must:
 - keep the order of events of each vehicle (out-of-order and GPS-jump detection depend on it);
 - never lose an event, even when the worker, database, Redis or Kafka fails;
 - never count an event twice, even though Kafka delivers at-least-once and producers resend;
-- raise alerts (for example speeding) exactly once per triggering event;
+- raise alerts (for example speeding): persisted exactly once per triggering event, published to Kafka at-least-once;
 - keep up with load, and show a lag/backpressure signal instead of dropping data.
 
 ## Architecture
@@ -87,7 +87,7 @@ Example: `curl -H "X-Api-Key: <key>" http://localhost:8080/alerts`
 ```powershell
 dotnet test TelemetryCore.sln        # unit + integration (integration needs Docker running)
 scripts\demo.ps1                     # end-to-end load demo, prints PASS only if every number matches
-scripts\chaos.ps1                    # planned: failure scenarios <!-- VERIFY -->
+scripts\chaos.ps1 -Scenario kill     # failure scenarios: kill | postgres | redis | rebalance
 scripts\verify-security.ps1          # container hardening and secret checks
 scripts\verify-infra.ps1             # smoke check of topics, Redis, Postgres roles
 ```
@@ -96,20 +96,20 @@ Details in [docs/TESTING.md](docs/TESTING.md).
 
 ## Measured results
 
-Local laptop measurements, single-node Kafka. Not a benchmark.
+Local laptop measurements, single-node Kafka, one worker replica. Not a benchmark. Raw outputs are written under `artifacts/` by the scripts.
 
 | Metric | Value |
 |---|---|
-| Machine | <!-- MEASURED: CPU / RAM / OS --> |
-| Events sent | <!-- MEASURED: total --> |
-| Sustained throughput (events/s) | <!-- MEASURED: events/s --> |
-| p95 processing latency | <!-- MEASURED: seconds --> |
-| p95 batch duration | <!-- MEASURED: seconds --> |
-| Duplicates detected vs injected | <!-- MEASURED: counted / injected --> |
-| Out-of-order detected vs injected | <!-- MEASURED: counted / injected --> |
-| DLQ messages vs invalid injected | <!-- MEASURED: counted / injected --> |
-| Recovery after worker kill | <!-- MEASURED: seconds, rows lost/duplicated --> |
-| Recovery after DB outage | <!-- MEASURED: seconds, circuit behavior --> |
+| Machine | 8 logical CPUs, 15.4 GB RAM, Windows 11; Docker Desktop limited to 8 CPUs / 7.5 GB |
+| Events sent | 100,000 and 1,000,000 (`scripts\demo.ps1 -Total ...`), both PASS |
+| Processing throughput (events/s) | peak 6,955 (100k run), 6,864 (1M run); generator produced 14,760 / 18,458 events/s |
+| p95 processing latency (event timestamp to persisted) | 18.8 s (100k), 30 s = histogram ceiling (1M). Dominated by queueing: the generator produces 2.1-2.7x faster than one worker persists, so events wait in Kafka (max lag 88,551 / 850,717) |
+| p95 batch duration | 0.88 s (100k), 0.60 s (1M) |
+| Duplicates detected vs injected | 2,000 / 2,000 (100k); 20,000 / 20,000 (1M) |
+| Out-of-order detected vs injected | 1,000 / 1,000 (100k); 10,000 / 10,000 (1M) |
+| DLQ messages vs invalid injected | 500 / 500 (100k); 5,000 / 5,000 (1M, 1,000 per reason) |
+| Recovery after worker kill (`docker kill -s KILL`, 100k) | PASS: 97,500 / 97,500 unique rows, none lost or duplicated; lag 49,751 while down, 0 about 55 s after the restart |
+| Recovery after DB outage (PostgreSQL stopped 20 s, 100k) | PASS: 97,500 / 97,500 unique rows; lag held at 59,901 during the outage (backpressure, nothing dropped) and reached 0 about 27 s after PostgreSQL started. The breaker gauge sampled by Prometheus stayed at 0 (closed), so circuit opening was not observed in this run |
 
 ## Design decisions
 
@@ -135,6 +135,8 @@ All in [docs/DECISIONS.md](docs/DECISIONS.md). Highlights:
 - Poison outbox rows are retried forever (no outbox DLQ or attempt limit).
 - Kubernetes manifests were validated offline but not run on a cluster.
 - Only the `SPEEDING` alert is implemented.
+- The Compose worker publishes a fixed host port (8081), so `--scale worker=2` fails; rebalance is tested in-process (`ResilienceTests`) and in Kubernetes via KEDA replicas.
+- Latency under backlog: one worker persists ~6.9k events/s; when producers are faster, p95 latency reflects time queued in Kafka (30 s histogram ceiling in the 1M run).
 
 ## Repository structure
 
@@ -150,7 +152,7 @@ tests/
 db/                             roles and schema (init scripts)
 deploy/
   docker-compose.yml  prometheus/  grafana/  k8s/
-scripts/                        up, down, demo, verify-infra, verify-security
+scripts/                        up, down, demo, chaos, verify-infra, verify-security
 docs/                           ARCHITECTURE.md, TESTING.md, DECISIONS.md
 SPEC.md
 ```
