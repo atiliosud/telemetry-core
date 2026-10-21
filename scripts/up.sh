@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Starts the local stack. Works from any cwd.
+# Note: DB role passwords (.env) are applied only on the first init of the pgdata volume.
+# After changing them, run scripts/down.sh --purge (or down.ps1 -Purge) and start again.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ ! -f "$ROOT/.env" ]; then
