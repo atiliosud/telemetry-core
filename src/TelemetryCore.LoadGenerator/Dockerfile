@@ -14,5 +14,6 @@ RUN dotnet publish src/TelemetryCore.LoadGenerator/TelemetryCore.LoadGenerator.c
 FROM mcr.microsoft.com/dotnet/runtime:8.0
 WORKDIR /app
 COPY --from=build /app .
-USER app
+# Numeric UID (the "app" user of the .NET 8 images) so Kubernetes runAsNonRoot can verify it.
+USER 1654
 ENTRYPOINT ["dotnet", "TelemetryCore.LoadGenerator.dll"]

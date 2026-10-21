@@ -13,7 +13,8 @@ WORKDIR /app
 COPY --from=build /app .
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
-USER app
+# Numeric UID (the "app" user of the .NET 8 images) so Kubernetes runAsNonRoot can verify it.
+USER 1654
 # No curl/wget in the base image: the API binary probes its own liveness endpoint.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=6 CMD ["dotnet", "/app/TelemetryCore.ReadApi.dll", "--healthcheck"]
 ENTRYPOINT ["dotnet", "TelemetryCore.ReadApi.dll"]
