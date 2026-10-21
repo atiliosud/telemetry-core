@@ -39,13 +39,15 @@ spec:
           type: RuntimeDefault
       containers:
         - name: worker
-          image: telemetry-core/worker:latest # replace with your registry tag
+          image: telemetry-core/worker:0.1.0 # placeholder tag; replace with your registry tag (see kustomization images)
           ports:
             - name: http
               containerPort: 8080
           env:
             - name: DOTNET_gcServer
               value: "1"
+            - name: DOTNET_GCHeapCount # cap server-GC heaps so memory stays modest under the limit
+              value: "2"
             - name: Worker__BootstrapServers
               value: kafka:9092 # replace with your Kafka bootstrap address
             - name: Worker__PostgresConnectionString
@@ -64,6 +66,12 @@ spec:
               port: http
             periodSeconds: 5
             failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12 # up to 60 s for cold start before liveness applies
           livenessProbe:
             httpGet:
               path: /health/live
@@ -72,16 +80,18 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           lifecycle:
+            # Shutdown budget: 2 s preStop + up to 15 s channel drain + flush/commit, all within the host's
+            # 25 s ShutdownTimeout, so worst case 27 s < terminationGracePeriodSeconds 30.
             preStop:
               exec:
-                command: ["sleep", "5"] # let endpoints settle before SIGTERM
+                command: ["sleep", "2"]
           resources:
             requests:
               cpu: 250m
-              memory: 256Mi
+              memory: 512Mi
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             runAsNonRoot: true
             runAsUser: 1654

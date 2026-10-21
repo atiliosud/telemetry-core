@@ -7,5 +7,14 @@ resources:
   - worker-service.yaml
   - readapi-deployment.yaml
   - readapi-service.yaml
+  - readapi-pdb.yaml
   - keda-scaledobject.yaml
 # secrets.example.yaml is intentionally NOT listed: create the real Secret out-of-band.
+# Example: point the placeholder tags at your registry (kustomize edit set image ... or here).
+# images:
+#   - name: telemetry-core/worker
+#     newName: registry.example.com/telemetry-core/worker
+#     newTag: 0.1.0
+#   - name: telemetry-core/read-api
+#     newName: registry.example.com/telemetry-core/read-api
+#     newTag: 0.1.0

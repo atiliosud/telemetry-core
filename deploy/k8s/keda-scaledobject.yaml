@@ -9,6 +9,8 @@ metadata:
 spec:
   scaleTargetRef:
     name: worker
+  pollingInterval: 15 # seconds between lag checks
+  cooldownPeriod: 300 # slow scale-down: every replica change rebalances the consumer group
   minReplicaCount: 1
   maxReplicaCount: 12 # = partitions of telemetry.raw; extra consumers would sit idle
   triggers:
