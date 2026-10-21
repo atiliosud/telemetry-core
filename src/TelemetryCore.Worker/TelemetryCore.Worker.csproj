@@ -5,6 +5,14 @@
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Confluent.Kafka" />
+    <PackageReference Include="Npgsql" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="TelemetryCore.Worker.Tests" />
+    <InternalsVisibleTo Include="TelemetryCore.IntegrationTests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\TelemetryCore.Contracts\TelemetryCore.Contracts.csproj" />
     <ProjectReference Include="..\TelemetryCore.Domain\TelemetryCore.Domain.csproj" />
   </ItemGroup>
