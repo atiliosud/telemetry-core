@@ -69,16 +69,15 @@ public sealed class OutboxTests
             await insert.ExecuteNonQueryAsync();
         }
 
-        await using var dataSource = NpgsqlDataSource.Create(_stack.WorkerConnectionString);
-        await using (var down = Start(dataSource, "127.0.0.1:1"))
+        await using (var down = Start("127.0.0.1:1"))
         {
-            await Task.Delay(TimeSpan.FromSeconds(3));
+            await TelemetryStackFixture.WaitUntilAsync(() => Task.FromResult(down.SendFailures > 0), TimeSpan.FromSeconds(30));
             await down.StopAsync(CancellationToken.None);
         }
 
         (await PendingAsync(vehicle)).Should().Be(1, "Kafka was unreachable");
 
-        await using (var up = Start(dataSource, _stack.BootstrapServers))
+        await using (var up = Start(_stack.BootstrapServers))
         {
             await TelemetryStackFixture.WaitUntilAsync(async () => await PendingAsync(vehicle) == 0, Timeout);
             await up.StopAsync(CancellationToken.None);
@@ -88,10 +87,47 @@ public sealed class OutboxTests
         messages.Should().ContainSingle();
     }
 
-    private static StartedPublisher Start(NpgsqlDataSource dataSource, string bootstrap)
+    [Fact]
+    public async Task PoisonRow_StaysPending_AndDoesNotBlockValidRows()
+    {
+        var prefix = TelemetryStackFixture.UniqueName("veh");
+        var poison = prefix + "-poison";
+        var good = new[] { prefix + "-a", prefix + "-b" };
+        await InsertOutboxAsync("bad topic!", poison); // lowest id: first in every poll
+        foreach (var key in good)
+        {
+            await InsertOutboxAsync(Topics.Alerts, key);
+        }
+
+        await using var publisher = Start(_stack.BootstrapServers);
+        foreach (var key in good)
+        {
+            await TelemetryStackFixture.WaitUntilAsync(async () => await PendingAsync(key) == 0, Timeout);
+        }
+
+        await publisher.StopAsync(CancellationToken.None);
+        (await PendingAsync(poison)).Should().Be(1, "the poison row is never marked");
+        var keys = (await _stack.ConsumeAllAsync(Topics.Alerts)).Select(m => m.Message.Key).ToList();
+        keys.Should().Contain(good);
+    }
+
+    private async Task InsertOutboxAsync(string topic, string key)
+    {
+        var payload = JsonSerializer.Serialize(
+            new SpeedingAlertMessage(Guid.NewGuid(), key, "SPEEDING", DateTimeOffset.UtcNow, 3, 40, -3, 130), TelemetryJsonContext.Default.SpeedingAlertMessage);
+        await using var admin = new NpgsqlConnection(_stack.AdminConnectionString);
+        await admin.OpenAsync();
+        await using var insert = new NpgsqlCommand("INSERT INTO outbox (topic, key, payload) VALUES (@t, @k, @p::jsonb)", admin);
+        insert.Parameters.AddWithValue("t", topic);
+        insert.Parameters.AddWithValue("k", key);
+        insert.Parameters.AddWithValue("p", payload);
+        await insert.ExecuteNonQueryAsync();
+    }
+
+    private StartedPublisher Start(string bootstrap)
     {
         var options = new WorkerOptions { BootstrapServers = bootstrap, OutboxPollInterval = TimeSpan.FromMilliseconds(100) };
-        var publisher = new OutboxPublisher(options, dataSource, NullLogger<OutboxPublisher>.Instance);
+        var publisher = new OutboxPublisher(options, NpgsqlDataSource.Create(_stack.WorkerConnectionString), NullLogger<OutboxPublisher>.Instance);
         publisher.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
         return new StartedPublisher(publisher);
     }
@@ -118,6 +154,7 @@ public sealed class OutboxTests
     {
         private readonly OutboxPublisher _publisher;
         public StartedPublisher(OutboxPublisher publisher) => _publisher = publisher;
+        public long SendFailures => _publisher.SendFailures;
         public Task StopAsync(CancellationToken ct) => _publisher.StopAsync(ct);
         public ValueTask DisposeAsync()
         {

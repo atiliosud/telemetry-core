@@ -10,17 +10,17 @@ namespace TelemetryCore.Worker.Outbox;
 /// Publishes pending <c>outbox</c> rows to Kafka (D8: at-least-once). Every poll runs one transaction that locks up to
 /// <see cref="BatchLimit"/> unpublished rows (<c>FOR UPDATE SKIP LOCKED</c>, so replicas never take the same row), sends
 /// them through the bulkhead (4 concurrent, 100 queued) and marks the acknowledged ones. A failed send leaves the row
-/// pending for the next poll. The publisher has its own producer and its own small connection pool, so it can never
+/// pending for the next poll. The publisher owns (and disposes) the data source it is given. The publisher has its own producer and its own small connection pool, so it can never
 /// starve ingestion, and it never throws into the host.
 /// </summary>
 public sealed partial class OutboxPublisher : BackgroundService
 {
     public const int BatchLimit = 100;
 
-    private const string SelectSql = """
-        SELECT id, topic, key, payload::text FROM outbox
-        WHERE published_utc IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED
-        """;
+    private const string SelectSql =
+        "SELECT id, topic, key, payload::text FROM outbox WHERE published_utc IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED";
+    // Keep the SQL literal in step with BatchLimit.
+    private static readonly string SelectBatchSql = SelectSql.Replace("LIMIT 100", "LIMIT " + BatchLimit, StringComparison.Ordinal);
 
     private const string MarkSql = "UPDATE outbox SET published_utc = now() WHERE id = ANY(@published)";
 
@@ -28,6 +28,7 @@ public sealed partial class OutboxPublisher : BackgroundService
     private readonly IProducer<string, string> _producer;
     private readonly ResiliencePipeline _bulkhead = ResiliencePipelines.CreateOutbox();
     private readonly TimeSpan _pollInterval;
+    private long _sendFailures;
     private readonly ILogger<OutboxPublisher> _log;
 
     public OutboxPublisher(WorkerOptions options, NpgsqlDataSource outboxDataSource, ILogger<OutboxPublisher> log)
@@ -44,6 +45,9 @@ public sealed partial class OutboxPublisher : BackgroundService
             MessageTimeoutMs = 10_000,
         }).Build();
     }
+
+    /// <summary>Number of failed sends so far (diagnostics and tests).</summary>
+    public long SendFailures => Interlocked.Read(ref _sendFailures);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -84,7 +88,7 @@ public sealed partial class OutboxPublisher : BackgroundService
         await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
 
         var rows = new List<(long Id, string Topic, string Key, string Payload)>();
-        await using (var select = new NpgsqlCommand(SelectSql, conn, tx))
+        await using (var select = new NpgsqlCommand(SelectBatchSql, conn, tx))
         await using (var reader = await select.ExecuteReaderAsync(ct).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(ct).ConfigureAwait(false))
@@ -114,9 +118,17 @@ public sealed partial class OutboxPublisher : BackgroundService
             }
             catch (Exception ex)
             {
-                if (!batchCts.IsCancellationRequested)
+                if (batchCts.IsCancellationRequested)
                 {
-                    LogSendFailed(_log, ex, row.Id);
+                    return; // aborted because the batch was cancelled
+                }
+
+                Interlocked.Increment(ref _sendFailures);
+                LogSendFailed(_log, ex, row.Id);
+                if (IsBrokerUnavailable(ex))
+                {
+                    // The broker is down: no point waiting on the rest. Any other error is specific to this row
+                    // (a poison row), so the rest of the batch continues and the row simply stays pending.
                     await batchCts.CancelAsync().ConfigureAwait(false);
                 }
             }
@@ -140,9 +152,15 @@ public sealed partial class OutboxPublisher : BackgroundService
         return published.Count;
     }
 
+    private static bool IsBrokerUnavailable(Exception ex) =>
+        ex is ProduceException<string, string> { Error.Code: ErrorCode.Local_MsgTimedOut or ErrorCode.Local_AllBrokersDown
+            or ErrorCode.Local_Transport or ErrorCode.Local_Resolve or ErrorCode.BrokerNotAvailable or ErrorCode.NetworkException
+            or ErrorCode.Local_TimedOut };
+
     public override void Dispose()
     {
         _producer.Dispose();
+        _dataSource.Dispose();
         base.Dispose();
     }
 
