@@ -28,14 +28,18 @@ public sealed class WorkerEndpointTests
         await using var worker = new WorkerHarness(_stack, topic, TelemetryStackFixture.UniqueName("group"),
             new Dictionary<string, string?> { ["Worker:DlqTopic"] = dlq });
         await worker.StartAsync();
-        await _stack.ProduceAsync(new[]
+        var valid = new TelemetryEventDto
         {
-            new TelemetryEventDto
-            {
-                EventId = Guid.NewGuid(), VehicleId = vehicle, Seq = 1, TimestampUtc = DateTimeOffset.UtcNow.AddMinutes(-1),
-                Lat = 40, Lon = -3, SpeedKmh = 50, Ignition = true,
-            },
-        }, topic);
+            EventId = Guid.NewGuid(), VehicleId = vehicle, Seq = 1, TimestampUtc = DateTimeOffset.UtcNow.AddMinutes(-1),
+            Lat = 40, Lon = -3, SpeedKmh = 50, Ignition = true,
+        };
+        // One valid event, the same event again (duplicate), one out-of-range latitude and one non-JSON payload.
+        var badLat = new TelemetryEventDto
+        {
+            EventId = Guid.NewGuid(), VehicleId = vehicle, Seq = 2, TimestampUtc = DateTimeOffset.UtcNow.AddMinutes(-1),
+            Lat = 200, Lon = -3, SpeedKmh = 50, Ignition = true,
+        };
+        await _stack.ProduceAsync(new[] { valid, valid, badLat }, topic);
         await _stack.ProduceRawAsync(vehicle, Encoding.UTF8.GetBytes("not json"), topic);
 
         using var http = new HttpClient { BaseAddress = worker.BaseAddress };
@@ -43,22 +47,30 @@ public sealed class WorkerEndpointTests
         await TelemetryStackFixture.WaitUntilAsync(async () =>
         {
             text = await http.GetStringAsync("/metrics");
-            return Value(text, "telemetry_events_processed_total") >= 1 && Value(text, "telemetry_dlq_total") >= 1;
+            return Value(text, "telemetry_events_processed_total") >= 1 && Value(text, "telemetry_dlq_total") >= 2
+                && Value(text, "telemetry_duplicates_total") >= 1;
         }, ProcessingTimeout);
 
         foreach (var name in new[]
                  {
                      "telemetry_events_consumed_total", "telemetry_events_processed_total", "telemetry_duplicates_total",
                      "telemetry_out_of_order_total", "telemetry_dlq_total", "telemetry_gps_jumps_total", "telemetry_alerts_raised_total",
-                     "telemetry_redis_fallback_total", "telemetry_circuit_breaker_state",
+                     "telemetry_redis_fallback_total", "telemetry_circuit_breaker_state", "telemetry_channel_depth",
+                     "telemetry_batch_duration_seconds_bucket", "telemetry_batch_duration_seconds_count",
+                     "telemetry_processing_latency_seconds_bucket", "telemetry_processing_latency_seconds_sum",
                  })
         {
             text.Should().MatchRegex("(?m)^" + name + "[{ ]", $"{name} must be exported under its SPEC §10 name");
         }
 
+        text.Should().MatchRegex(@"(?m)^telemetry_dlq_total\{[^}]*reason=""lat_out_of_range""[^}]*\} [1-9]");
+        text.Should().MatchRegex(@"(?m)^telemetry_channel_depth\{[^}]*partition=""\d+""");
+        text.Should().MatchRegex(@"(?m)^telemetry_batch_duration_seconds_bucket\{[^}]*le=""0.005""");
+        text.Should().MatchRegex(@"(?m)^telemetry_processing_latency_seconds_bucket\{[^}]*le=""30""");
+        Value(text, "telemetry_processing_latency_seconds_count").Should().BeGreaterThanOrEqualTo(1);
         text.Should().Contain("reason=\"invalid_json\"");
         text.Should().Contain("type=\"SPEEDING\"");
-        Value(text, "telemetry_events_consumed_total").Should().BeGreaterThanOrEqualTo(2);
+        Value(text, "telemetry_events_consumed_total").Should().BeGreaterThanOrEqualTo(4);
         Value(text, "telemetry_circuit_breaker_state").Should().Be(0);
     }
 

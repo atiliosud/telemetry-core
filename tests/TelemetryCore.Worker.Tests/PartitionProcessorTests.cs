@@ -359,6 +359,54 @@ public sealed class PartitionProcessorTests
         _offsets.Stored.Should().Equal((Partition, 1L));
     }
 
+    [Fact]
+    public async Task Flush_EmitsBatchSpanWithDistinctProducerLinks_AndRecordsTimings()
+    {
+        var spans = new List<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = s => s.Name == Tracing.SourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+            ActivityStopped = a =>
+            {
+                lock (spans)
+                {
+                    spans.Add(a);
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        var producers = Enumerable.Range(0, 40)
+            .Select(_ => new ActivityContext(ActivityTraceId.CreateRandom(), ActivitySpanId.CreateRandom(), ActivityTraceFlags.Recorded))
+            .ToArray();
+        using var cts = new CancellationTokenSource();
+        var run = StartProcessor(cts.Token);
+        // 45 events: 40 distinct producer contexts, the first 5 repeated, so links are de-duplicated and capped at 32.
+        for (var i = 0; i < 45; i++)
+        {
+            await WriteValidAsync(1, producers[i % 40]);
+        }
+
+        _clock.Advance(TimeSpan.FromSeconds(2)); // every event is now 2 s old
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        Activity batch;
+        lock (spans)
+        {
+            batch = spans.Should().ContainSingle(a => a.OperationName == "batch.process" && Equals(a.GetTagItem("partition"), Partition)).Subject;
+        }
+
+        batch.GetTagItem("batch.size").Should().Be(45);
+        batch.Links.Should().HaveCount(Tracing.MaxLinks);
+        batch.Links.Select(l => l.Context.SpanId).Should().OnlyHaveUniqueItems();
+        batch.Links.Select(l => l.Context).Should().BeSubsetOf(producers);
+        batch.Parent.Should().BeNull("a batch has many producers, so they are links, not a parent (D14)");
+        _observer.BatchDurations.Should().ContainSingle();
+        _observer.Latencies.Should().HaveCount(45).And.OnlyContain(l => l >= 2.0);
+    }
+
     private Task StartProcessor(CancellationToken ct, IDedupeHint? hint = null, IProcessingObserver? observer = null)
     {
         var processor = new PartitionProcessor(Partition, _channel.Reader, _committer, hint ?? new NoopDedupeHint(), _dlq, _offsets,
@@ -366,7 +414,7 @@ public sealed class PartitionProcessorTests
         return Task.Run(() => processor.RunAsync(ct));
     }
 
-    private async Task WriteValidAsync(int count)
+    private async Task WriteValidAsync(int count, ActivityContext parent = default)
     {
         for (var i = 0; i < count; i++)
         {
@@ -382,14 +430,14 @@ public sealed class PartitionProcessorTests
                 SpeedKmh = 50,
                 Ignition = true,
             };
-            await WriteAsync(JsonSerializer.SerializeToUtf8Bytes(dto, TelemetryJsonContext.Default.TelemetryEventDto));
+            await WriteAsync(JsonSerializer.SerializeToUtf8Bytes(dto, TelemetryJsonContext.Default.TelemetryEventDto), parent);
         }
     }
 
-    private ValueTask WriteAsync(byte[]? value)
+    private ValueTask WriteAsync(byte[]? value, ActivityContext parent = default)
     {
         var offset = _nextOffset++;
-        return _channel.Writer.WriteAsync(new PartitionMessage(Partition, offset, "k", value, default(ActivityContext), _clock.GetUtcNow()));
+        return _channel.Writer.WriteAsync(new PartitionMessage(Partition, offset, "k", value, parent, _clock.GetUtcNow()));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, Action? onEachPoll = null)
@@ -667,5 +715,45 @@ public sealed class PartitionProcessorTests
         public void OnRedisFallback()
         {
         }
+
+        public IReadOnlyList<double> BatchDurations
+        {
+            get
+            {
+                lock (_timings)
+                {
+                    return _timings.Where(t => t.Batch).Select(t => t.Seconds).ToArray();
+                }
+            }
+        }
+
+        public IReadOnlyList<double> Latencies
+        {
+            get
+            {
+                lock (_timings)
+                {
+                    return _timings.Where(t => !t.Batch).Select(t => t.Seconds).ToArray();
+                }
+            }
+        }
+
+        public void RecordBatchDuration(double seconds)
+        {
+            lock (_timings)
+            {
+                _timings.Add((true, seconds));
+            }
+        }
+
+        public void RecordLatency(double seconds)
+        {
+            lock (_timings)
+            {
+                _timings.Add((false, seconds));
+            }
+        }
+
+        private readonly List<(bool Batch, double Seconds)> _timings = new();
     }
 }

@@ -2,6 +2,10 @@ using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
+using Serilog;
+using Serilog.Extensions.Logging;
+using Serilog.Formatting.Compact;
 using TelemetryCore.Worker.Dedupe;
 using TelemetryCore.Worker.Dlq;
 using TelemetryCore.Worker.Health;
@@ -38,6 +42,7 @@ public static class Program
     {
         var builder = WebApplication.CreateBuilder(args);
         configure?.Invoke(builder.Configuration);
+        ConfigureLogging(builder);
 
         var services = builder.Services;
         services.AddOptions<WorkerOptions>()
@@ -60,6 +65,7 @@ public static class Program
             ResiliencePipelines.CreateDatabase(sp.GetRequiredService<CircuitStateTracker>(),
                 sp.GetRequiredService<ILoggerFactory>().CreateLogger("TelemetryCore.Worker.Resilience.Database"),
                 sp.GetRequiredService<TimeProvider>())));
+        services.AddSingleton<ChannelDepthRegistry>();
         services.AddSingleton<TelemetryMetrics>();
         services.AddSingleton<IProcessingObserver>(sp => sp.GetRequiredService<TelemetryMetrics>());
         services.AddSingleton<IDedupeHint>(CreateDedupeHint);
@@ -73,9 +79,17 @@ public static class Program
                 ApplicationName = "telemetry-worker-outbox",
             }.ConnectionString), sp.GetRequiredService<ILogger<OutboxPublisher>>()));
         services.AddHealthChecks().AddCheck<ReadinessCheck>("readiness", tags: new[] { ReadinessCheck.Tag });
-        services.AddOpenTelemetry().WithMetrics(metrics => metrics
+        var otel = services.AddOpenTelemetry().WithMetrics(metrics => metrics
             .AddMeter(TelemetryMetrics.MeterName)
             .AddPrometheusExporter());
+        // Traces only when a collector is configured (OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://jaeger:4317); without
+        // one no span is created at all. The service name comes from OTEL_SERVICE_NAME.
+        if (!string.IsNullOrWhiteSpace(builder.Configuration[OtlpEndpointKey]))
+        {
+            otel.WithTracing(tracing => tracing
+                .AddSource(Tracing.SourceName)
+                .AddOtlpExporter());
+        }
 
         overrides?.Invoke(services);
 
@@ -84,6 +98,27 @@ public static class Program
         app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = check => check.Tags.Contains(ReadinessCheck.Tag) });
         app.MapPrometheusScrapingEndpoint(); // /metrics
         return app;
+    }
+
+    internal const string OtlpEndpointKey = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+    /// <summary>
+    /// Serilog compact JSON on the console (SPEC §10), one object per line. Serilog is only the sink: level filtering
+    /// stays with the standard <c>Logging:LogLevel</c> configuration (defaults below; hot-path logs are Debug).
+    /// </summary>
+    private static void ConfigureLogging(WebApplicationBuilder builder)
+    {
+        builder.Logging.ClearProviders();
+        builder.Logging.SetMinimumLevel(LogLevel.Information);
+        builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+        builder.Logging.AddFilter("System.Net.Http", LogLevel.Warning);
+        var logger = new LoggerConfiguration()
+            .MinimumLevel.Verbose()
+            .Enrich.FromLogContext()
+            .WriteTo.Console(new CompactJsonFormatter())
+            .CreateLogger();
+        // AddProvider, not AddSerilog: AddSerilog adds a provider rule that lets every level through, bypassing the filters above.
+        builder.Logging.AddProvider(new SerilogLoggerProvider(logger, dispose: true));
     }
 
     /// <summary>Redis hint when <c>Worker:RedisConnectionString</c> is set; otherwise no hint (the DB key alone decides, D1).</summary>

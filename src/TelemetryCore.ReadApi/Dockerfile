@@ -14,4 +14,6 @@ COPY --from=build /app .
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
 USER app
+# No curl/wget in the base image: the API binary probes its own liveness endpoint.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=6 CMD ["dotnet", "/app/TelemetryCore.ReadApi.dll", "--healthcheck"]
 ENTRYPOINT ["dotnet", "TelemetryCore.ReadApi.dll"]

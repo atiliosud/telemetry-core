@@ -4,7 +4,8 @@ name: telemetry-core
 #   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build --wait
 # The load generator is a one-shot tool (profile "tools"), started by scripts/demo.ps1 | scripts/demo.sh:
 #   docker compose --env-file .env -f deploy/docker-compose.yml run --rm generator --total 100000
-# Later services (read-api, observability) are added to this file.
+# Observability: Prometheus http://localhost:9090, Grafana http://localhost:3000 (dashboard "Telemetry Core"),
+# Jaeger http://localhost:16686. Host ports bind to 127.0.0.1 only.
 
 services:
   kafka:
@@ -101,6 +102,8 @@ services:
       Worker__PostgresConnectionString: Host=postgres;Database=telemetry;Username=telemetry_worker;Password=${TELEMETRY_WORKER_DB_PASSWORD:?set TELEMETRY_WORKER_DB_PASSWORD in .env};Maximum Pool Size=30;GSS Encryption Mode=Disable
       Worker__RedisConnectionString: redis:6379
       DOTNET_gcServer: "1"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: telemetry-worker
     ports:
       - "127.0.0.1:8081:8080"
     # SIGTERM → stop consuming, drain, flush, commit offsets (target < 20 s; host ShutdownTimeout 25 s).
@@ -128,12 +131,119 @@ services:
         condition: service_healthy
     # Extra arguments of "docker compose run --rm generator ..." are appended (later flags win).
     entrypoint: ["dotnet", "TelemetryCore.LoadGenerator.dll", "--bootstrap", "kafka:9092"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OTEL_SERVICE_NAME: telemetry-generator
     read_only: true
     tmpfs:
       - /tmp
     security_opt:
       - no-new-privileges:true
 
+  read-api:
+    build:
+      context: ..
+      dockerfile: src/TelemetryCore.ReadApi/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ReadApi__PostgresConnectionString: Host=postgres;Database=telemetry;Username=telemetry_reader;Password=${TELEMETRY_READER_DB_PASSWORD:?set TELEMETRY_READER_DB_PASSWORD in .env};GSS Encryption Mode=Disable
+      TELEMETRY_API_KEY: ${TELEMETRY_API_KEY:?set TELEMETRY_API_KEY in .env}
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "dotnet", "/app/TelemetryCore.ReadApi.dll", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # Consumer lag (D15), also while the worker is down: kafka_consumergroup_lag{consumergroup="telemetry-worker"}.
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["--kafka.server=kafka:9092"]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: prom/prometheus:v3.13.5
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --storage.tsdb.retention.size=300MB
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana-oss:12.4.2
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/telemetry-core.json
+      # Offline-friendly: no plugin downloads, update checks or usage reporting at startup.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Traces (D14): OTLP gRPC on 4317 inside the network, UI on 16686. In-memory store, capped.
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "10000"
+    ports:
+      - "127.0.0.1:16686:16686"
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   pgdata:
     name: telemetry-core-pgdata
+  promdata:
+    name: telemetry-core-promdata

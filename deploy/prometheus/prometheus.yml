@@ -1,0 +1,22 @@
+# Scraped every 5 s. Retention is capped by flags in docker-compose.yml (2 days / 300 MB).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # One target per worker container: Docker's DNS returns every replica for the service name, so
+  # "docker compose up --scale worker=N" is picked up without config changes.
+  - job_name: worker
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: [worker]
+        type: A
+        port: 8080
+        refresh_interval: 5s
+
+  # Consumer lag per partition (D15): kafka_consumergroup_lag{consumergroup="telemetry-worker"}.
+  - job_name: kafka-exporter
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # The Read API exposes no /metrics endpoint (only /health/*), so it is not scraped.

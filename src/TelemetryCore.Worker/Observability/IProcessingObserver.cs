@@ -24,4 +24,14 @@ public interface IProcessingObserver
     void OnConsumed()
     {
     }
+
+    /// <summary>Time to process one committed batch (<c>telemetry_batch_duration_seconds</c>).</summary>
+    void RecordBatchDuration(double seconds)
+    {
+    }
+
+    /// <summary>Now − event timestamp for one committed event (<c>telemetry_processing_latency_seconds</c>).</summary>
+    void RecordLatency(double seconds)
+    {
+    }
 }

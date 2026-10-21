@@ -2,14 +2,15 @@
 # End-to-end demo (CHECKPOINT 1): runs the load generator against the running stack and checks the numbers.
 #   scripts/up.sh                     # once
 #   scripts/demo.sh --total 100000    # PASS / FAIL, exit code 0 / 1
-# Baseline and final values come from Postgres (rows in processed_events) and from the worker's /metrics endpoint,
-# so earlier runs do not matter: only deltas are compared. Each run uses fresh vehicle ids (--vehicle-prefix) and a
+# Baseline and final values come from Postgres (rows in processed_events) and from Prometheus (sum over every worker
+# replica, e.g. sum(telemetry_duplicates_total)); when Prometheus is not reachable the worker's /metrics endpoint is
+# read directly. Earlier runs do not matter: only deltas are compared. Each run uses fresh vehicle ids (--vehicle-prefix) and a
 # fresh seed, so it never collides with stored vehicle state or event ids of earlier runs.
 # Output is saved to artifacts/demo-<timestamp>.txt. Needs: docker, curl, awk.
 set -uo pipefail
 
 TOTAL=100000; DUPLICATES=2; OUT_OF_ORDER=1; INVALID=0.5; SPEEDING=5; VEHICLES=1000; TIMEOUT_MIN=10; SEED=0
-METRICS_URL="http://localhost:8081/metrics"; COPY_TO=""
+METRICS_URL="http://localhost:8081/metrics"; PROM_URL="http://localhost:9090"; COPY_TO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --total) TOTAL="$2"; shift 2 ;;
@@ -21,6 +22,7 @@ while [ $# -gt 0 ]; do
     --timeout-minutes) TIMEOUT_MIN="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --metrics-url) METRICS_URL="$2"; shift 2 ;;
+    --prometheus-url) PROM_URL="$2"; shift 2 ;;
     --copy-to) COPY_TO="$2"; shift 2 ;;
     *) echo "Unknown option $1"; exit 2 ;;
   esac
@@ -67,9 +69,46 @@ metric_sum() {
   awk -v n="$1" '$0 !~ /^#/ { name=$1; sub(/\{.*/, "", name); if (name == n) { v=$NF; if ($0 ~ /\} /) { split($0, a, "} "); split(a[2], b, " "); v=b[1] } else { v=$2 }; s += v } } END { printf "%d", s }' <<<"$2"
 }
 
+# Prometheus instant query -> raw JSON (fails when Prometheus is unreachable or the query fails).
+prom_query() {
+  local out; out="$(curl -fsS -G "$PROM_URL/api/v1/query" --data-urlencode "query=$1")" || return 1
+  case "$out" in *'"status":"success"'*) echo "$out" ;; *) return 1 ;; esac
+}
+# Sum of the values of a Prometheus query result (0 when empty), as an integer.
+prom_sum() {
+  local out; out="$(prom_query "$1")" || return 1
+  grep -o '"value":\[[^]]*\]' <<<"$out" | sed -E 's/.*,"([^"]*)"\]/\1/' | awk '$1 != "NaN" { s += $1 } END { printf "%d", s }'
+}
+# Same, with decimals (for the run summary).
+prom_float() {
+  local out; out="$(prom_query "$1")" || return 1
+  grep -o '"value":\[[^]]*\]' <<<"$out" | sed -E 's/.*,"([^"]*)"\]/\1/' | awk '$1 != "NaN" { s += $1 } END { printf "%.3f", s }'
+}
+
+# Prometheus is the source when it already scrapes the worker; otherwise fall back to the worker's /metrics.
+USE_PROM=0
+if out="$(prom_query 'sum(telemetry_events_consumed_total)' 2>/dev/null)" && grep -q '"value"' <<<"$out"; then USE_PROM=1; fi
+
+# DLQ count per reason, one "reason count" line each.
+dlq_by_reason() {
+  if [ "$USE_PROM" = 1 ]; then
+    prom_query 'sum by (reason) (telemetry_dlq_total)' | grep -o '"reason":"[^"]*"},"value":\[[^]]*\]' \
+      | sed -E 's/"reason":"([^"]*)"\},"value":\[[^,]*,"([^"]*)"\]/\1 \2/'
+  else
+    curl -fsS "$METRICS_URL" | sed -nE 's/^telemetry_dlq_total\{.*reason="([^"]+)".*\} ([0-9.eE+]+).*/\1 \2/p' \
+      | awk '{ s[$1] += $2 } END { for (r in s) printf "%s %d\n", r, s[r] }'
+  fi
+}
+
 # Snapshot: rows consumed duplicates outOfOrder dlq circuit
 snapshot() {
-  local text rows; text="$(curl -fsS "$METRICS_URL")" || return 1
+  local text rows
+  if [ "$USE_PROM" = 1 ]; then
+    rows="$(db_count)" || return 1
+    echo "$rows $(prom_sum 'sum(telemetry_events_consumed_total)') $(prom_sum 'sum(telemetry_duplicates_total)') $(prom_sum 'sum(telemetry_out_of_order_total)') $(prom_sum 'sum(telemetry_dlq_total)') $(prom_sum 'max(telemetry_circuit_breaker_state)')"
+    return 0
+  fi
+  text="$(curl -fsS "$METRICS_URL")" || return 1
   rows="$(db_count)" || return 1
   echo "$rows $(metric_sum telemetry_events_consumed_total "$text") $(metric_sum telemetry_duplicates_total "$text") $(metric_sum telemetry_out_of_order_total "$text") $(metric_sum telemetry_dlq_total "$text") $(metric_sum telemetry_circuit_breaker_state "$text")"
 }
@@ -84,6 +123,8 @@ decreased() { # decreased "<before snapshot>" "<after snapshot>"
 # wait_stable <stable-seconds> <min-rows or empty>: prints "<snapshot>|<seconds since START when min-rows was reached>".
 wait_stable() {
   local stable="$1" min_rows="${2:-}" deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+  # Prometheus scrapes every 5 s: "stable" must span at least two scrapes, or a stale value looks final.
+  if [ "$USE_PROM" = 1 ] && [ "$stable" -lt 12 ]; then stable=12; fi
   local last now since reached=""
   last="$(snapshot)"; since=$(date +%s)
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -103,12 +144,17 @@ RESTART_FLAG="$(mktemp)"; echo 0 > "$RESTART_FLAG"
 
 say "Telemetry Core demo  $(date '+%Y-%m-%d %H:%M:%S')"
 say "Generator: --total $TOTAL --vehicles $VEHICLES --duplicates $DUPLICATES --out-of-order $OUT_OF_ORDER --invalid $INVALID --speeding-vehicles $SPEEDING --seed $SEED --vehicle-prefix $PREFIX"
-curl -fsS "$METRICS_URL" >/dev/null || { say "Worker metrics not reachable at $METRICS_URL. Run scripts/up.sh first."; exit 1; }
+if [ "$USE_PROM" = 1 ]; then say "Metrics source: Prometheus ($PROM_URL)"
+else
+  curl -fsS "$METRICS_URL" >/dev/null || { say "Neither Prometheus ($PROM_URL) nor worker metrics ($METRICS_URL) reachable. Run scripts/up.sh first."; exit 1; }
+  say "Metrics source: worker /metrics ($METRICS_URL); Prometheus not reachable"
+fi
 
 echo "Waiting for the worker to be idle (no change for 5 s) before taking the baseline..."
 IDLE="$(wait_stable 5)" || { say "Worker did not become idle within $TIMEOUT_MIN min (or a snapshot failed); aborting."; exit 1; }
 BASE="${IDLE%%|*}"
 read -r B_ROWS B_CONSUMED B_DUP B_OOO B_DLQ B_CIRCUIT <<<"$BASE"
+BASE_DLQ="$(dlq_by_reason)"
 echo 0 > "$RESTART_FLAG"
 say "Baseline: rows=$B_ROWS duplicates=$B_DUP outOfOrder=$B_OOO dlq=$B_DLQ"
 [ "$B_CIRCUIT" = "1" ] && say "WARNING: the DB circuit breaker is OPEN at baseline (telemetry_circuit_breaker_state = 1); processing may stall."
@@ -130,6 +176,8 @@ TIMED_OUT=0
 DONE="$(wait_stable 3 $(( B_ROWS + EXPECTED )))" || TIMED_OUT=1
 FINAL="${DONE%%|*}"
 read -r F_ROWS F_CONSUMED F_DUP F_OOO F_DLQ F_CIRCUIT <<<"$FINAL"
+FINAL_DLQ="$(dlq_by_reason)"
+RUN_SECONDS=$(( ( $(now_ms) - START_MS ) / 1000 + 1 ))
 REACHED="${DONE##*|}"; [ -n "$REACHED" ] || REACHED=$(now_ms)
 ELAPSED_MS=$(( REACHED - START_MS ))
 
@@ -153,6 +201,18 @@ say "$(printf '| %-28s | %12.0f |' 'Generator events/s' "$GEN_EPS")"
 say "$(printf '| %-28s | %12s |' 'End-to-end s (incl. startup)' "$(awk -v ms="$ELAPSED_MS" 'BEGIN { printf "%.1f", ms / 1000 }')")"
 say "$(printf '| %-28s | %12s |' 'End-to-end events/s' "$EPS")"
 say "$SEP"
+DLQ_DELTA="$(awk 'NR == FNR { b[$1] = $2; next } { d = $2 - b[$1]; if (d != 0) printf "  %-22s %8d\n", $1, d }' <(echo "$BASE_DLQ") <(echo "$FINAL_DLQ") | sort)"
+if [ -n "$DLQ_DELTA" ]; then say "DLQ by reason (this run):"; say "$DLQ_DELTA"; fi
+if [ "$USE_PROM" = 1 ]; then
+  # Run window as seen by Prometheus (generator start .. now); 15 s rate windows = three scrapes.
+  W="${RUN_SECONDS}s"
+  PEAK="$(prom_float "max_over_time(sum(rate(telemetry_events_processed_total[15s]))[$W:5s])")"
+  P95_LAT="$(prom_float "histogram_quantile(0.95, sum by (le) (increase(telemetry_processing_latency_seconds_bucket[$W])))")"
+  P95_BATCH="$(prom_float "histogram_quantile(0.95, sum by (le) (increase(telemetry_batch_duration_seconds_bucket[$W])))")"
+  MAX_LAG="$(prom_float "max_over_time(sum(kafka_consumergroup_lag{consumergroup=\"telemetry-worker\"})[$W:5s])")"
+  say "$(printf 'Prometheus over the run (%s): peak processed/s %.0f (15 s rate), p95 latency %.3f s, p95 batch %.3f s, max lag %.0f' \
+    "$W" "${PEAK:-0}" "${P95_LAT:-0}" "${P95_BATCH:-0}" "${MAX_LAG:-0}")"
+fi
 
 if [ "$(cat "$RESTART_FLAG")" = "1" ] || decreased "$BASE" "$FINAL"; then
   RESTART=1

@@ -28,6 +28,7 @@ public sealed partial class IngestionService : BackgroundService
     private readonly IDedupeHint _dedupe;
     private readonly IDlqPublisher _dlq;
     private readonly IProcessingObserver _observer;
+    private readonly ChannelDepthRegistry _channels;
     private readonly VehicleStateCache _cache;
     private readonly IngestionStatus _status;
     private readonly TimeProvider _clock;
@@ -39,13 +40,15 @@ public sealed partial class IngestionService : BackgroundService
     private IOffsetSink? _offsetSink;
 
     public IngestionService(IOptions<WorkerOptions> options, IBatchCommitter committer, IDedupeHint dedupe, IDlqPublisher dlq,
-        IProcessingObserver observer, VehicleStateCache cache, IngestionStatus status, TimeProvider clock, ILoggerFactory loggerFactory)
+        IProcessingObserver observer, ChannelDepthRegistry channels, VehicleStateCache cache, IngestionStatus status, TimeProvider clock,
+        ILoggerFactory loggerFactory)
     {
         _options = options.Value;
         _committer = committer;
         _dedupe = dedupe;
         _dlq = dlq;
         _observer = observer;
+        _channels = channels;
         _cache = cache;
         _status = status;
         _clock = clock;
@@ -180,6 +183,7 @@ public sealed partial class IngestionService : BackgroundService
                 _options, _loggerFactory.CreateLogger<PartitionProcessor>());
             var task = Task.Run(() => processor.RunAsync(abort.Token), CancellationToken.None);
             _workers[partition] = new PartitionWorker(channel, task, abort);
+            _channels.Register(partition, channel.Reader);
         }
 
         LogAssigned(_log, partitions.Count, _workers.Count);
@@ -196,6 +200,7 @@ public sealed partial class IngestionService : BackgroundService
         {
             if (_workers.Remove(tpo.Partition.Value, out var worker))
             {
+                _channels.Unregister(tpo.Partition.Value);
                 worker.Channel.Writer.TryComplete();
                 drained.Add((tpo.Partition.Value, worker));
             }
@@ -265,6 +270,11 @@ public sealed partial class IngestionService : BackgroundService
             {
                 worker.Abort.Dispose();
             }
+        }
+
+        foreach (var partition in _workers.Keys)
+        {
+            _channels.Unregister(partition);
         }
 
         _workers.Clear();

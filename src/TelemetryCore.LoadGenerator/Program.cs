@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Confluent.Kafka;
+using OpenTelemetry;
+using OpenTelemetry.Trace;
 using TelemetryCore.Contracts;
 using TelemetryCore.LoadGenerator;
 
@@ -16,14 +18,20 @@ catch (ArgumentException ex)
     return 2;
 }
 
-// Spans need a listener to exist; no exporter is needed, only the W3C context for the traceparent header.
+// Spans need a listener to exist. With OTEL_EXPORTER_OTLP_ENDPOINT set (e.g. http://jaeger:4317) the chunk spans are
+// exported, so a trace shows generator -> worker (the worker's batch spans link to them); otherwise a bare listener is
+// enough to get the W3C context for the traceparent header. Disposing the provider flushes the last spans.
+const string SourceName = "TelemetryCore.LoadGenerator";
+using var tracerProvider = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT"))
+    ? null
+    : Sdk.CreateTracerProviderBuilder().AddSource(SourceName).AddOtlpExporter().Build();
 using var listener = new ActivityListener
 {
-    ShouldListenTo = s => s.Name == "TelemetryCore.LoadGenerator",
+    ShouldListenTo = s => tracerProvider is null && s.Name == SourceName,
     Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
 };
 ActivitySource.AddActivityListener(listener);
-using var source = new ActivitySource("TelemetryCore.LoadGenerator");
+using var source = new ActivitySource(SourceName);
 
 var config = new ProducerConfig
 {

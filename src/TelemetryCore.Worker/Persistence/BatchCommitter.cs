@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using Npgsql;
 using TelemetryCore.Contracts;
 using TelemetryCore.Domain;
+using TelemetryCore.Worker.Observability;
 
 namespace TelemetryCore.Worker.Persistence;
 
@@ -34,12 +36,19 @@ public sealed class BatchCommitter : IBatchCommitter
             return new PersistResult(0, 0, 0, 0, Array.Empty<SpeedingAlertMessage>());
         }
 
+        // Child of batch.process (one span per transaction attempt, so retries are visible).
+        using var span = Tracing.Source.StartActivity("db.write", ActivityKind.Client);
+        span?.SetTag("db.system", "postgresql");
+        span?.SetTag("batch.size", events.Length);
         try
         {
-            return await CommitCoreAsync(events, partition, ct).ConfigureAwait(false);
+            var result = await CommitCoreAsync(events, partition, ct).ConfigureAwait(false);
+            span?.SetTag("inserted", result.Inserted);
+            return result;
         }
-        catch
+        catch (Exception ex)
         {
+            span?.SetStatus(ActivityStatusCode.Error, ex.GetType().Name);
             // The outcome may be unknown (e.g. COMMIT reached Postgres but the reply was lost). A retry would then see
             // no new ids and never publish, so drop the cached state of every vehicle in the batch: the next attempt
             // reloads the truth from vehicle_state.

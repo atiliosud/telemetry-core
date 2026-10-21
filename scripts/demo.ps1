@@ -1,8 +1,9 @@
 # End-to-end demo (CHECKPOINT 1): runs the load generator against the running stack and checks the numbers.
 #   scripts\up.ps1                    # once
 #   scripts\demo.ps1 -Total 100000    # PASS / FAIL, exit code 0 / 1
-# Baseline and final values come from Postgres (rows in processed_events) and from the worker's /metrics endpoint,
-# so earlier runs do not matter: only deltas are compared. Each run uses fresh vehicle ids (--vehicle-prefix) and a
+# Baseline and final values come from Postgres (rows in processed_events) and from Prometheus (sum over every worker
+# replica, e.g. sum(telemetry_duplicates_total)); when Prometheus is not reachable the worker's /metrics endpoint is
+# read directly. Earlier runs do not matter: only deltas are compared. Each run uses fresh vehicle ids (--vehicle-prefix) and a
 # fresh seed, so it never collides with stored vehicle state or event ids of earlier runs.
 # Output is saved to artifacts\demo-<timestamp>.txt.
 param(
@@ -16,6 +17,7 @@ param(
     # 0 = random seed per run.
     [int]$Seed = 0,
     [string]$MetricsUrl = 'http://localhost:8081/metrics',
+    [string]$PrometheusUrl = 'http://localhost:9090',
     # Optional extra copy of the output file (e.g. a measurements folder outside the repo).
     [string]$CopyTo = ''
 )
@@ -50,6 +52,33 @@ function Get-DbCount {
     return [long]$text.Trim()
 }
 
+# Prometheus instant query; returns the result vector (throws when Prometheus is unreachable or the query fails).
+function Get-PromVector {
+    param([string]$Query)
+    $wc = New-Object System.Net.WebClient
+    try { $json = $wc.DownloadString("$PrometheusUrl/api/v1/query?query=" + [uri]::EscapeDataString($Query)) } finally { $wc.Dispose() }
+    $r = $json | ConvertFrom-Json
+    if ($r.status -ne 'success') { throw "Prometheus query failed: $Query" }
+    return , @($r.data.result) # comma: keep a one-element array an array
+}
+
+# Sum of a Prometheus query result (0 when empty).
+function Get-PromSum {
+    param([string]$Query)
+    $sum = 0.0
+    foreach ($s in (Get-PromVector $Query)) {
+        $v = [string]$s.value[1]
+        if ($v -ne 'NaN') { $sum += [double]::Parse($v, $inv) }
+    }
+    return $sum
+}
+
+# Prometheus is the source when it already scrapes the worker; otherwise fall back to the worker's /metrics.
+$script:usePrometheus = $false
+function Select-MetricsSource {
+    try { $script:usePrometheus = @(Get-PromVector 'sum(telemetry_events_consumed_total)').Count -gt 0 } catch { $script:usePrometheus = $false }
+}
+
 function Get-MetricsText {
     $wc = New-Object System.Net.WebClient
     try { return $wc.DownloadString($MetricsUrl) } finally { $wc.Dispose() }
@@ -66,7 +95,33 @@ function Get-MetricSum {
     return [long]$sum
 }
 
+# DLQ count per reason (hashtable reason -> count).
+function Get-DlqByReason {
+    $byReason = @{}
+    if ($script:usePrometheus) {
+        foreach ($s in (Get-PromVector 'sum by (reason) (telemetry_dlq_total)')) { $byReason[[string]$s.metric.reason] = [long][double]::Parse([string]$s.value[1], $inv) }
+    }
+    else {
+        foreach ($line in ((Get-MetricsText) -split "`n")) {
+            $m = [regex]::Match($line, '^telemetry_dlq_total\{[^}]*reason="([^"]+)"[^}]*\}\s+(\S+)')
+            if ($m.Success) { $byReason[$m.Groups[1].Value] = [long]$byReason[$m.Groups[1].Value] + [long][double]::Parse($m.Groups[2].Value, $inv) }
+        }
+    }
+    return $byReason
+}
+
 function Get-Snapshot {
+    if ($script:usePrometheus) {
+        return [pscustomobject]@{
+            Rows       = Get-DbCount
+            Processed  = [long](Get-PromSum 'sum(telemetry_events_processed_total)')
+            Duplicates = [long](Get-PromSum 'sum(telemetry_duplicates_total)')
+            OutOfOrder = [long](Get-PromSum 'sum(telemetry_out_of_order_total)')
+            Dlq        = [long](Get-PromSum 'sum(telemetry_dlq_total)')
+            Consumed   = [long](Get-PromSum 'sum(telemetry_events_consumed_total)')
+            Circuit    = [long](Get-PromSum 'max(telemetry_circuit_breaker_state)')
+        }
+    }
     $text = Get-MetricsText
     return [pscustomobject]@{
         Rows       = Get-DbCount
@@ -95,6 +150,8 @@ function Same {
 # Waits until nothing changes for $StableSeconds (worker idle), optionally only after $Condition holds.
 function Wait-Stable {
     param([int]$StableSeconds, [scriptblock]$Condition = { $true }, [System.Diagnostics.Stopwatch]$Clock = $null)
+    # Prometheus scrapes every 5 s: "stable" must span at least two scrapes, or a stale value looks final.
+    if ($script:usePrometheus -and $StableSeconds -lt 12) { $StableSeconds = 12 }
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     $last = Get-Snapshot
     $stableSince = Get-Date
@@ -136,12 +193,18 @@ function Invoke-Demo {
     Say "Telemetry Core demo  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     Say "Generator: --total $Total --vehicles $Vehicles --duplicates $Duplicates --out-of-order $OutOfOrder --invalid $Invalid --speeding-vehicles $SpeedingVehicles --seed $Seed --vehicle-prefix $prefix"
 
-    try { $null = Get-MetricsText } catch { Say "Worker metrics not reachable at $MetricsUrl. Run scripts\up.ps1 first."; return 1 }
+    Select-MetricsSource
+    if ($script:usePrometheus) { Say "Metrics source: Prometheus ($PrometheusUrl)" }
+    else {
+        try { $null = Get-MetricsText } catch { Say "Neither Prometheus ($PrometheusUrl) nor worker metrics ($MetricsUrl) reachable. Run scripts\up.ps1 first."; return 1 }
+        Say "Metrics source: worker /metrics ($MetricsUrl); Prometheus not reachable"
+    }
 
     Write-Host 'Waiting for the worker to be idle (no change for 5 s) before taking the baseline...'
     $idle = Wait-Stable -StableSeconds 5
     if ($idle.TimedOut) { Say "Worker did not become idle within $TimeoutMinutes min; aborting."; return 1 }
     $base = $idle.Snapshot
+    $baseDlq = Get-DlqByReason
     $script:restartDetected = $false
     Say "Baseline: rows=$($base.Rows) duplicates=$($base.Duplicates) outOfOrder=$($base.OutOfOrder) dlq=$($base.Dlq)"
     if ($base.Circuit -eq 1) { Say 'WARNING: the DB circuit breaker is OPEN at baseline (telemetry_circuit_breaker_state = 1); processing may stall.' }
@@ -167,6 +230,8 @@ function Invoke-Demo {
     Write-Host "Waiting for $expected new unique rows (timeout $TimeoutMinutes min)..."
     $done = Wait-Stable -StableSeconds 3 -Clock $clock -Condition { param($s) ($s.Rows - $base.Rows) -ge $expected }
     $final = $done.Snapshot
+    $finalDlq = Get-DlqByReason
+    $runSeconds = [int][math]::Ceiling($clock.Elapsed.TotalSeconds)
     if ($null -ne $done.ReachedAt) { $elapsed = [double]$done.ReachedAt } else { $elapsed = $clock.Elapsed.TotalSeconds }
 
     $processed = $final.Rows - $base.Rows
@@ -198,6 +263,24 @@ function Invoke-Demo {
     Say ('| {0,-28} | {1,12} |' -f 'End-to-end s (incl. startup)', $elapsed.ToString('F1', $inv))
     Say ('| {0,-28} | {1,12} |' -f 'End-to-end events/s', $eps)
     Say $sep
+    $reasons = @($finalDlq.Keys | Sort-Object | Where-Object { ([long]$finalDlq[$_] - [long]$baseDlq[$_]) -ne 0 })
+    if ($reasons.Count -gt 0) {
+        Say 'DLQ by reason (this run):'
+        foreach ($r in $reasons) { Say ('  {0,-22} {1,8}' -f $r, ([long]$finalDlq[$r] - [long]$baseDlq[$r])) }
+    }
+    if ($script:usePrometheus) {
+        # Run window as seen by Prometheus (generator start .. now); 15 s rate windows = three scrapes.
+        $w = "$($runSeconds)s"
+        try {
+            $peak = Get-PromSum "max_over_time(sum(rate(telemetry_events_processed_total[15s]))[$($w):5s])"
+            $p95Latency = Get-PromSum "histogram_quantile(0.95, sum by (le) (increase(telemetry_processing_latency_seconds_bucket[$w])))"
+            $p95Batch = Get-PromSum "histogram_quantile(0.95, sum by (le) (increase(telemetry_batch_duration_seconds_bucket[$w])))"
+            $maxLag = Get-PromSum "max_over_time(sum(kafka_consumergroup_lag{consumergroup=`"telemetry-worker`"})[$($w):5s])"
+            Say ([string]::Format($inv, 'Prometheus over the run ({0}): peak processed/s {1:F0} (15 s rate), p95 latency {2:F3} s, p95 batch {3:F3} s, max lag {4:F0}',
+                $w, $peak, $p95Latency, $p95Batch, $maxLag))
+        }
+        catch { Say "Prometheus run summary unavailable: $($_.Exception.Message)" }
+    }
 
     if ($script:restartDetected -or (Test-Decrease $base $final)) {
         Say 'WORKER RESTART DETECTED: a metrics counter went down during the run. The worker keeps its counters in memory,'

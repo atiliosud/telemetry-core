@@ -7,6 +7,11 @@ using Microsoft.Extensions.Options;
 using Npgsql;
 using TelemetryCore.ReadApi;
 
+if (args.Length > 0 && args[0] == HealthProbe.Argument)
+{
+    return await HealthProbe.RunAsync();
+}
+
 var builder = WebApplication.CreateBuilder(args);
 var services = builder.Services;
 
@@ -66,7 +71,8 @@ var app = builder.Build();
 app.UseRateLimiter();
 app.UseMiddleware<ApiKeyMiddleware>();
 app.MapReadApi();
-app.Run();
+await app.RunAsync();
+return 0;
 
 /// <summary>Entry point marker for <c>WebApplicationFactory&lt;Program&gt;</c>.</summary>
 public partial class Program

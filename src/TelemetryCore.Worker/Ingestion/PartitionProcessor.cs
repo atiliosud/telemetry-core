@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Threading.Channels;
 using TelemetryCore.Domain;
 using TelemetryCore.Worker.Dedupe;
@@ -30,6 +31,7 @@ public sealed partial class PartitionProcessor
     private readonly TimeProvider _clock;
     private readonly WorkerOptions _options;
     private readonly ILogger _log;
+    private readonly Tracing.LinkCollector _links = new();
 
     public PartitionProcessor(int partition, ChannelReader<PartitionMessage> reader, IBatchCommitter committer, IDedupeHint dedupe,
         IDlqPublisher dlq, IOffsetSink offsets, IProcessingObserver observer, TimeProvider clock, WorkerOptions o, ILogger log)
@@ -51,6 +53,8 @@ public sealed partial class PartitionProcessor
     public async Task RunAsync(CancellationToken ct)
     {
         var buffer = ArrayPool<TelemetryEvent>.Shared.Rent(_options.BatchSize);
+        var offsets = ArrayPool<long>.Shared.Rent(_options.BatchSize); // Kafka offset of each buffered event, for logs
+        var batch = new Batch(buffer, offsets);
         try
         {
             var completed = false;
@@ -63,7 +67,7 @@ public sealed partial class PartitionProcessor
 
                 var count = 0;
                 var messages = 0;
-                count = await AddAsync(first, buffer, count, ct).ConfigureAwait(false);
+                count = await AddAsync(first, batch, count, ct).ConfigureAwait(false);
                 messages++;
                 var lastOffset = first.Offset;
 
@@ -74,7 +78,7 @@ public sealed partial class PartitionProcessor
                     {
                         if (_reader.TryRead(out var next))
                         {
-                            count = await AddAsync(next, buffer, count, ct).ConfigureAwait(false);
+                            count = await AddAsync(next, batch, count, ct).ConfigureAwait(false);
                             messages++;
                             lastOffset = next.Offset;
                             continue;
@@ -100,7 +104,7 @@ public sealed partial class PartitionProcessor
                     }
                 }
 
-                await FlushAsync(buffer, count, lastOffset, ct).ConfigureAwait(false);
+                await FlushAsync(batch, count, messages, lastOffset, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -110,14 +114,17 @@ public sealed partial class PartitionProcessor
         finally
         {
             ArrayPool<TelemetryEvent>.Shared.Return(buffer, clearArray: true); // drop string references
+            ArrayPool<long>.Shared.Return(offsets);
         }
     }
 
-    private async ValueTask<int> AddAsync(PartitionMessage msg, TelemetryEvent[] buffer, int count, CancellationToken ct)
+    private async ValueTask<int> AddAsync(PartitionMessage msg, Batch batch, int count, CancellationToken ct)
     {
+        _links.Add(msg.ParentContext);
         if (EventValidator.TryParse(msg.Value, _clock.GetUtcNow(), out var evt, out var reason))
         {
-            buffer[count] = evt;
+            batch.Events[count] = evt;
+            batch.Offsets[count] = msg.Offset;
             return count + 1;
         }
 
@@ -136,6 +143,8 @@ public sealed partial class PartitionProcessor
             }
         }
 
+        LogSentToDlq(_log, msg.Key, _partition, msg.Offset, reason!);
+
         // Outside the retry loop: an observer failure must never republish the message.
         try
         {
@@ -149,20 +158,36 @@ public sealed partial class PartitionProcessor
         return count;
     }
 
-    private async Task FlushAsync(TelemetryEvent[] buffer, int count, long lastOffset, CancellationToken ct)
+    private async Task FlushAsync(Batch batch, int count, int messages, long lastOffset, CancellationToken ct)
     {
         if (count == 0)
         {
+            _links.Clear();
             _offsets.Store(_partition, lastOffset + 1); // only invalid messages, all already in the DLQ
             return;
         }
 
+        var started = _clock.GetTimestamp();
+        using (var span = _links.StartBatch(_partition, messages))
+        {
+            _links.Clear();
+            await CommitBatchAsync(batch, count, lastOffset, span, ct).ConfigureAwait(false);
+        }
+
+        RecordBatchDuration(_clock.GetElapsedTime(started).TotalSeconds);
+        _offsets.Store(_partition, lastOffset + 1);
+    }
+
+    private async Task CommitBatchAsync(Batch batch, int count, long lastOffset, Activity? span, CancellationToken ct)
+    {
+        var buffer = batch.Events;
         var valid = count;
-        count = await DropKnownAsync(buffer, count, ct).ConfigureAwait(false);
+        count = await DropKnownAsync(batch, count, ct).ConfigureAwait(false);
         var knownByHint = valid - count;
         if (count == 0)
         {
             LogAllKnown(_log, _partition, knownByHint, lastOffset);
+            span?.SetTag("duplicates", knownByHint);
             NotifyBatch(0, knownByHint, 0, 0, 0);
         }
         else
@@ -187,13 +212,44 @@ public sealed partial class PartitionProcessor
 
             var duplicates = knownByHint + result.Duplicates;
             LogBatchCommitted(_log, _partition, count, result.Inserted, duplicates, lastOffset);
+            span?.SetTag("inserted", result.Inserted);
+            span?.SetTag("duplicates", duplicates);
+            span?.SetTag("commit.attempts", attempt + 1);
             NotifyBatch(result.Inserted, duplicates, result.OutOfOrder, result.GpsJumps, result.Alerts.Count);
+            RecordLatencies(buffer, count);
 
             // D1: keys only for committed events. Every event of the batch is in the DB now (new or duplicate).
             await MarkKnownAsync(buffer, count, ct).ConfigureAwait(false);
         }
+    }
 
-        _offsets.Store(_partition, lastOffset + 1);
+    private void RecordBatchDuration(double seconds)
+    {
+        try
+        {
+            _observer.RecordBatchDuration(seconds);
+        }
+        catch (Exception ex)
+        {
+            LogObserverFailed(_log, ex, _partition);
+        }
+    }
+
+    /// <summary>Now - event timestamp for every committed event of the batch (the generator stamps send time, D16).</summary>
+    private void RecordLatencies(TelemetryEvent[] buffer, int count)
+    {
+        try
+        {
+            var now = _clock.GetUtcNow();
+            for (var i = 0; i < count; i++)
+            {
+                _observer.RecordLatency((now - buffer[i].TimestampUtc).TotalSeconds);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogObserverFailed(_log, ex, _partition);
+        }
     }
 
     /// <summary>The batch is already committed: an observer failure is logged and must not stop the offset from being stored.</summary>
@@ -210,8 +266,9 @@ public sealed partial class PartitionProcessor
     }
 
     /// <summary>Removes events the hint already knows as committed; keeps batch order. Hint failures are ignored (the DB key decides).</summary>
-    private async ValueTask<int> DropKnownAsync(TelemetryEvent[] buffer, int count, CancellationToken ct)
+    private async ValueTask<int> DropKnownAsync(Batch batch, int count, CancellationToken ct)
     {
+        var buffer = batch.Events;
         var ids = ArrayPool<Guid>.Shared.Rent(count);
         try
         {
@@ -236,9 +293,11 @@ public sealed partial class PartitionProcessor
             {
                 if (i < known.Length && known[i])
                 {
+                    LogDuplicate(_log, buffer[i].VehicleId, _partition, batch.Offsets[i], buffer[i].EventId);
                     continue;
                 }
 
+                batch.Offsets[kept] = batch.Offsets[i];
                 buffer[kept++] = buffer[i];
             }
 
@@ -271,6 +330,15 @@ public sealed partial class PartitionProcessor
             ArrayPool<Guid>.Shared.Return(ids, clearArray: true);
         }
     }
+
+    /// <summary>Buffers of one partition processor: events and the Kafka offset of each, index-aligned.</summary>
+    private sealed record Batch(TelemetryEvent[] Events, long[] Offsets);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Message for vehicle {vehicleId} at partition {partition} offset {offset} sent to the DLQ: {reason}")]
+    private static partial void LogSentToDlq(ILogger log, string? vehicleId, int partition, long offset, string reason);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Duplicate event {eventId} for vehicle {vehicleId} at partition {partition} offset {offset} skipped (dedupe hint)")]
+    private static partial void LogDuplicate(ILogger log, string vehicleId, int partition, long offset, Guid eventId);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "Partition {Partition}: committed {Count} events ({Inserted} new; {Duplicates} duplicates incl. hint hits) up to offset {LastOffset}")]
     private static partial void LogBatchCommitted(ILogger log, int partition, int count, int inserted, int duplicates, long lastOffset);
