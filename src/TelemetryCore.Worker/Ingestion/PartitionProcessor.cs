@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using TelemetryCore.Domain;
 using TelemetryCore.Worker.Dedupe;
 using TelemetryCore.Worker.Dlq;
+using TelemetryCore.Worker.Observability;
 using TelemetryCore.Worker.Persistence;
 
 namespace TelemetryCore.Worker.Ingestion;
@@ -12,6 +13,8 @@ namespace TelemetryCore.Worker.Ingestion;
 /// <see cref="WorkerOptions.FlushInterval"/> since the first one, validates them (invalid ones go to the DLQ),
 /// commits the valid ones in one DB transaction and only then stores the next offset (D9).
 /// A failed commit keeps the batch and retries it until it succeeds or <c>ct</c> is cancelled (D11).
+/// The dedupe hint (D1) is checked before the commit (known events are skipped and counted as duplicates) and
+/// marked only after it; a failing hint never blocks the commit or the offset.
 /// </summary>
 public sealed partial class PartitionProcessor
 {
@@ -23,12 +26,13 @@ public sealed partial class PartitionProcessor
     private readonly IDedupeHint _dedupe;
     private readonly IDlqPublisher _dlq;
     private readonly IOffsetSink _offsets;
+    private readonly IProcessingObserver _observer;
     private readonly TimeProvider _clock;
     private readonly WorkerOptions _options;
     private readonly ILogger _log;
 
     public PartitionProcessor(int partition, ChannelReader<PartitionMessage> reader, IBatchCommitter committer, IDedupeHint dedupe,
-        IDlqPublisher dlq, IOffsetSink offsets, TimeProvider clock, WorkerOptions o, ILogger log)
+        IDlqPublisher dlq, IOffsetSink offsets, IProcessingObserver observer, TimeProvider clock, WorkerOptions o, ILogger log)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(o.BatchSize, 1);
         _partition = partition;
@@ -37,6 +41,7 @@ public sealed partial class PartitionProcessor
         _dedupe = dedupe;
         _dlq = dlq;
         _offsets = offsets;
+        _observer = observer;
         _clock = clock;
         _options = o;
         _log = log;
@@ -122,6 +127,7 @@ public sealed partial class PartitionProcessor
             try
             {
                 await _dlq.PublishAsync(msg, reason!, ct).ConfigureAwait(false);
+                _observer.OnDlq(reason!);
                 return count;
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
@@ -134,21 +140,30 @@ public sealed partial class PartitionProcessor
 
     private async Task FlushAsync(TelemetryEvent[] buffer, int count, long lastOffset, CancellationToken ct)
     {
-        if (count > 0)
+        if (count == 0)
         {
-            count = await DropKnownAsync(buffer, count, ct).ConfigureAwait(false);
+            _offsets.Store(_partition, lastOffset + 1); // only invalid messages, all already in the DLQ
+            return;
         }
 
-        if (count > 0)
+        var valid = count;
+        count = await DropKnownAsync(buffer, count, ct).ConfigureAwait(false);
+        var knownByHint = valid - count;
+        if (count == 0)
+        {
+            LogAllKnown(_log, _partition, knownByHint, lastOffset);
+            _observer.OnBatchCommitted(_partition, 0, knownByHint, 0, 0, 0);
+        }
+        else
         {
             var events = new ReadOnlyMemory<TelemetryEvent>(buffer, 0, count);
             var attempt = 0;
+            PersistResult result;
             while (true)
             {
                 try
                 {
-                    var result = await _committer.CommitAsync(events, _partition, ct).ConfigureAwait(false);
-                    LogBatchCommitted(_log, _partition, count, result.Inserted, result.Duplicates, lastOffset);
+                    result = await _committer.CommitAsync(events, _partition, ct).ConfigureAwait(false);
                     break;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
@@ -159,6 +174,11 @@ public sealed partial class PartitionProcessor
                 }
             }
 
+            var duplicates = knownByHint + result.Duplicates;
+            LogBatchCommitted(_log, _partition, count, result.Inserted, duplicates, lastOffset);
+            _observer.OnBatchCommitted(_partition, result.Inserted, duplicates, result.OutOfOrder, result.GpsJumps, result.Alerts.Count);
+
+            // D1: keys only for committed events. Every event of the batch is in the DB now (new or duplicate).
             await MarkKnownAsync(buffer, count, ct).ConfigureAwait(false);
         }
 
@@ -228,8 +248,11 @@ public sealed partial class PartitionProcessor
         }
     }
 
-    [LoggerMessage(Level = LogLevel.Debug, Message = "Partition {Partition}: committed {Count} events ({Inserted} new, {Duplicates} duplicates) up to offset {LastOffset}")]
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Partition {Partition}: committed {Count} events ({Inserted} new; {Duplicates} duplicates incl. hint hits) up to offset {LastOffset}")]
     private static partial void LogBatchCommitted(ILogger log, int partition, int count, int inserted, int duplicates, long lastOffset);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Partition {Partition}: all {Count} events already known by the hint, up to offset {LastOffset}")]
+    private static partial void LogAllKnown(ILogger log, int partition, int count, long lastOffset);
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Partition {Partition}: batch of {Count} events failed to commit (attempt {Attempt}); keeping it and retrying")]
     private static partial void LogCommitFailed(ILogger log, Exception ex, int partition, int count, int attempt);

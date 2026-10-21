@@ -10,6 +10,7 @@ using TelemetryCore.Domain;
 using TelemetryCore.Worker.Dedupe;
 using TelemetryCore.Worker.Dlq;
 using TelemetryCore.Worker.Ingestion;
+using TelemetryCore.Worker.Observability;
 using TelemetryCore.Worker.Persistence;
 
 namespace TelemetryCore.Worker.Tests;
@@ -27,6 +28,7 @@ public sealed class PartitionProcessorTests
     private readonly FakeDlq _dlq;
     private readonly FakeOffsets _offsets;
     private readonly WorkerOptions _options = new();
+    private readonly RecordingObserver _observer = new();
     private long _nextOffset;
 
     public PartitionProcessorTests()
@@ -204,6 +206,102 @@ public sealed class PartitionProcessorTests
     }
 
     [Fact]
+    public async Task KnownByHint_SkippedAndCountedAsDuplicate()
+    {
+        _committer.DuplicatesPerCall = 1; // the DB also reports one duplicate of its own
+        using var cts = new CancellationTokenSource();
+        var hint = new RecordingHint(_log) { KnownIndexes = new HashSet<int> { 1, 3 } };
+        var run = StartProcessor(cts.Token, hint);
+
+        await WriteValidAsync(5);
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        _committer.Calls.Should().ContainSingle().Which.Select(e => e.Seq).Should().Equal(0L, 2L, 4L);
+        _observer.Batches.Should().ContainSingle().Which.Should().Be((Partition, 2, 3, 0, 0, 0),
+            "2 known by the hint + 1 reported by the DB = 3 duplicates; inserted = 3 committed - 1 DB duplicate");
+        _offsets.Stored.Should().Equal((Partition, 5L));
+    }
+
+    [Fact]
+    public async Task KnownByHint_AllKnown_StillReportsDuplicates()
+    {
+        using var cts = new CancellationTokenSource();
+        var run = StartProcessor(cts.Token, new AllKnownHint());
+
+        await WriteValidAsync(4);
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        _committer.Calls.Should().BeEmpty();
+        _observer.Batches.Should().ContainSingle().Which.Should().Be((Partition, 0, 4, 0, 0, 0));
+    }
+
+    [Fact]
+    public async Task HintFailure_StillCommitsAll()
+    {
+        using var cts = new CancellationTokenSource();
+        var hint = new RecordingHint(_log) { Throw = true };
+        var run = StartProcessor(cts.Token, hint);
+
+        await WriteValidAsync(5);
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        _committer.Calls.Should().ContainSingle().Which.Should().HaveCount(5);
+        _offsets.Stored.Should().Equal(new[] { (Partition, 5L) }, "a failing hint never blocks the offset");
+        _observer.Batches.Should().ContainSingle().Which.Should().Be((Partition, 5, 0, 0, 0, 0));
+    }
+
+    [Fact]
+    public async Task MarkCalledOnlyAfterCommit()
+    {
+        using var cts = new CancellationTokenSource();
+        var hint = new RecordingHint(_log);
+        var run = StartProcessor(cts.Token, hint);
+
+        await WriteValidAsync(3);
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        _log.Should().Equal("commit:3", "mark:3", "offset:3");
+        hint.Marked.Should().Equal(_committer.Calls[0].Select(e => e.EventId));
+    }
+
+    [Fact]
+    public async Task MarkNeverCalled_WhenCommitFails()
+    {
+        _committer.FailuresBeforeSuccess = int.MaxValue;
+        using var cts = new CancellationTokenSource();
+        var hint = new RecordingHint(_log);
+        var run = StartProcessor(cts.Token, hint);
+
+        await WriteValidAsync(3);
+        _channel.Writer.Complete();
+        await WaitUntilAsync(() => _committer.Calls.Count >= 2, () => _clock.Advance(TimeSpan.FromMilliseconds(250)));
+
+        cts.Cancel();
+        await run.WaitAsync(Timeout);
+        hint.Marked.Should().BeEmpty("D1: a key is set only for committed events");
+        _offsets.Stored.Should().BeEmpty();
+        _observer.Batches.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task DlqPublish_IsReportedWithReason()
+    {
+        using var cts = new CancellationTokenSource();
+        var run = StartProcessor(cts.Token);
+
+        await WriteAsync(Encoding.UTF8.GetBytes("not json"));
+        await WriteAsync(Array.Empty<byte>());
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        _observer.DlqReasons.Should().Equal(DlqReasons.InvalidJson, DlqReasons.EmptyPayload);
+    }
+
+    [Fact]
     public async Task Cancelled_WhileCommitFails_ReturnsWithoutStoringOffset()
     {
         _committer.FailuresBeforeSuccess = int.MaxValue;
@@ -222,7 +320,7 @@ public sealed class PartitionProcessorTests
     private Task StartProcessor(CancellationToken ct, IDedupeHint? hint = null)
     {
         var processor = new PartitionProcessor(Partition, _channel.Reader, _committer, hint ?? new NoopDedupeHint(), _dlq, _offsets,
-            _clock, _options, NullLogger.Instance);
+            _observer, _clock, _options, NullLogger.Instance);
         return Task.Run(() => processor.RunAsync(ct));
     }
 
@@ -278,6 +376,8 @@ public sealed class PartitionProcessorTests
 
         public int FailuresBeforeSuccess { get; set; }
 
+        public int DuplicatesPerCall { get; set; }
+
         public IReadOnlyList<TelemetryEvent[]> Calls
         {
             get
@@ -316,7 +416,7 @@ public sealed class PartitionProcessorTests
                 _log.Add("commit:" + events.Length);
             }
 
-            return new PersistResult(events.Length, 0, 0, 0, Array.Empty<SpeedingAlertMessage>());
+            return new PersistResult(events.Length - DuplicatesPerCall, DuplicatesPerCall, 0, 0, Array.Empty<SpeedingAlertMessage>());
         }
     }
 
@@ -382,5 +482,113 @@ public sealed class PartitionProcessorTests
         }
 
         public ValueTask MarkAsync(ReadOnlyMemory<Guid> ids, CancellationToken ct) => ValueTask.CompletedTask;
+    }
+
+    /// <summary>Hint that knows the events at the given batch positions, can fail, and records what was marked.</summary>
+    private sealed class RecordingHint : IDedupeHint
+    {
+        private readonly List<string> _log;
+        private readonly List<Guid> _marked = new();
+
+        public RecordingHint(List<string> log) => _log = log;
+
+        public HashSet<int> KnownIndexes { get; init; } = new();
+
+        public bool Throw { get; init; }
+
+        public IReadOnlyList<Guid> Marked
+        {
+            get
+            {
+                lock (_marked)
+                {
+                    return _marked.ToArray();
+                }
+            }
+        }
+
+        public ValueTask<bool[]> AreKnownAsync(ReadOnlyMemory<Guid> ids, CancellationToken ct)
+        {
+            if (Throw)
+            {
+                throw new InvalidOperationException("simulated Redis failure");
+            }
+
+            var known = new bool[ids.Length];
+            for (var i = 0; i < known.Length; i++)
+            {
+                known[i] = KnownIndexes.Contains(i);
+            }
+
+            return ValueTask.FromResult(known);
+        }
+
+        public ValueTask MarkAsync(ReadOnlyMemory<Guid> ids, CancellationToken ct)
+        {
+            if (Throw)
+            {
+                throw new InvalidOperationException("simulated Redis failure");
+            }
+
+            lock (_marked)
+            {
+                _marked.AddRange(ids.ToArray());
+            }
+
+            lock (_log)
+            {
+                _log.Add("mark:" + ids.Length);
+            }
+
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingObserver : IProcessingObserver
+    {
+        private readonly List<(int, int, int, int, int, int)> _batches = new();
+        private readonly List<string> _dlq = new();
+
+        public IReadOnlyList<(int Partition, int Inserted, int Duplicates, int OutOfOrder, int GpsJumps, int Alerts)> Batches
+        {
+            get
+            {
+                lock (_batches)
+                {
+                    return _batches.ToArray();
+                }
+            }
+        }
+
+        public IReadOnlyList<string> DlqReasons
+        {
+            get
+            {
+                lock (_dlq)
+                {
+                    return _dlq.ToArray();
+                }
+            }
+        }
+
+        public void OnBatchCommitted(int partition, int inserted, int duplicates, int outOfOrder, int gpsJumps, int alerts)
+        {
+            lock (_batches)
+            {
+                _batches.Add((partition, inserted, duplicates, outOfOrder, gpsJumps, alerts));
+            }
+        }
+
+        public void OnDlq(string reason)
+        {
+            lock (_dlq)
+            {
+                _dlq.Add(reason);
+            }
+        }
+
+        public void OnRedisFallback()
+        {
+        }
     }
 }

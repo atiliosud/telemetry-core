@@ -4,6 +4,7 @@ using System.Text.Json;
 using Confluent.Kafka;
 using Confluent.Kafka.Admin;
 using Npgsql;
+using StackExchange.Redis;
 using TelemetryCore.Contracts;
 using TelemetryCore.Domain;
 using Testcontainers.Kafka;
@@ -37,6 +38,7 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
     private readonly RedisContainer _redis;
     private readonly KafkaContainer _kafka;
     private IProducer<string?, byte[]?>? _producer;
+    private ConnectionMultiplexer? _redisAdmin;
 
     public TelemetryStackFixture()
     {
@@ -107,11 +109,20 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
             Acks = Acks.All,
             LingerMs = 5,
         }).Build();
+
+        var redisOptions = ConfigurationOptions.Parse(RedisConnectionString);
+        redisOptions.AllowAdmin = true; // FLUSHALL in tests only
+        _redisAdmin = await ConnectionMultiplexer.ConnectAsync(redisOptions);
     }
 
     public async Task DisposeAsync()
     {
         _producer?.Dispose();
+        if (_redisAdmin is not null)
+        {
+            await _redisAdmin.DisposeAsync();
+        }
+
         await Task.WhenAll(_kafka.DisposeAsync().AsTask(), _redis.DisposeAsync().AsTask(), _postgres.DisposeAsync().AsTask());
     }
 
@@ -141,6 +152,19 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
     public async Task ProduceRawAsync(string? key, byte[]? value, string topic = Topics.Raw)
     {
         await _producer!.ProduceAsync(topic, new Message<string?, byte[]?> { Key = key, Value = value });
+    }
+
+    public Task<bool> RedisKeyExistsAsync(string key) => _redisAdmin!.GetDatabase().KeyExistsAsync(key);
+
+    public Task<TimeSpan?> RedisTimeToLiveAsync(string key) => _redisAdmin!.GetDatabase().KeyTimeToLiveAsync(key);
+
+    /// <summary>Simulates losing every Redis key (restart without persistence, eviction).</summary>
+    public async Task FlushRedisAsync()
+    {
+        foreach (var endpoint in _redisAdmin!.GetEndPoints())
+        {
+            await _redisAdmin.GetServer(endpoint).FlushAllDatabasesAsync();
+        }
     }
 
     public async Task<long> CountRowsAsync(string table, string? vehiclePrefix = null)

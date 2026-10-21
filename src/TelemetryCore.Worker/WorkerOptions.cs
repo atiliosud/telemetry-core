@@ -9,6 +9,7 @@ public sealed class WorkerOptions
 
     public string BootstrapServers { get; set; } = "localhost:29092";
     public string Topic { get; set; } = Topics.Raw;
+    public string DlqTopic { get; set; } = Topics.Dlq;
     public string GroupId { get; set; } = "telemetry-worker";
     public int ChannelCapacity { get; set; } = 1000;
     public int BatchSize { get; set; } = 500;

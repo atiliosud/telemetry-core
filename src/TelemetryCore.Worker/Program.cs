@@ -3,7 +3,9 @@ using Npgsql;
 using TelemetryCore.Worker.Dedupe;
 using TelemetryCore.Worker.Dlq;
 using TelemetryCore.Worker.Ingestion;
+using TelemetryCore.Worker.Observability;
 using TelemetryCore.Worker.Persistence;
+using TelemetryCore.Worker.Resilience;
 
 namespace TelemetryCore.Worker;
 
@@ -39,8 +41,9 @@ public static class Program
         services.AddSingleton<TelemetryRepository>();
         services.AddSingleton<VehicleStateCache>();
         services.AddSingleton<IBatchCommitter, BatchCommitter>();
-        services.AddSingleton<IDedupeHint, NoopDedupeHint>();
-        services.AddSingleton<IDlqPublisher, LoggingDlqPublisher>();
+        services.AddSingleton<IProcessingObserver, NoopProcessingObserver>();
+        services.AddSingleton<IDedupeHint>(CreateDedupeHint);
+        services.AddSingleton<IDlqPublisher, KafkaDlqPublisher>();
         services.AddHostedService<IngestionService>();
         services.AddHealthChecks();
 
@@ -50,5 +53,19 @@ public static class Program
         app.MapHealthChecks("/health/live");
         app.MapHealthChecks("/health/ready"); // stub: real dependency checks come with the readiness task
         return app;
+    }
+
+    /// <summary>Redis hint when <c>Worker:RedisConnectionString</c> is set; otherwise no hint (the DB key alone decides, D1).</summary>
+    private static IDedupeHint CreateDedupeHint(IServiceProvider sp)
+    {
+        var connectionString = sp.GetRequiredService<WorkerOptions>().RedisConnectionString;
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            return new NoopDedupeHint();
+        }
+
+        var observer = sp.GetRequiredService<IProcessingObserver>();
+        return RedisDedupeHint.Connect(connectionString, ResiliencePipelines.CreateRedis(sp.GetRequiredService<TimeProvider>()),
+            observer.OnRedisFallback, sp.GetRequiredService<ILoggerFactory>().CreateLogger<RedisDedupeHint>());
     }
 }

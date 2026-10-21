@@ -6,6 +6,7 @@ using Microsoft.Extensions.Options;
 using TelemetryCore.Contracts;
 using TelemetryCore.Worker.Dedupe;
 using TelemetryCore.Worker.Dlq;
+using TelemetryCore.Worker.Observability;
 using TelemetryCore.Worker.Persistence;
 
 namespace TelemetryCore.Worker.Ingestion;
@@ -26,6 +27,7 @@ public sealed partial class IngestionService : BackgroundService
     private readonly IBatchCommitter _committer;
     private readonly IDedupeHint _dedupe;
     private readonly IDlqPublisher _dlq;
+    private readonly IProcessingObserver _observer;
     private readonly VehicleStateCache _cache;
     private readonly TimeProvider _clock;
     private readonly ILoggerFactory _loggerFactory;
@@ -36,12 +38,13 @@ public sealed partial class IngestionService : BackgroundService
     private IOffsetSink? _offsetSink;
 
     public IngestionService(IOptions<WorkerOptions> options, IBatchCommitter committer, IDedupeHint dedupe, IDlqPublisher dlq,
-        VehicleStateCache cache, TimeProvider clock, ILoggerFactory loggerFactory)
+        IProcessingObserver observer, VehicleStateCache cache, TimeProvider clock, ILoggerFactory loggerFactory)
     {
         _options = options.Value;
         _committer = committer;
         _dedupe = dedupe;
         _dlq = dlq;
+        _observer = observer;
         _cache = cache;
         _clock = clock;
         _loggerFactory = loggerFactory;
@@ -144,8 +147,8 @@ public sealed partial class IngestionService : BackgroundService
                 SingleWriter = true,
             });
             var abort = new CancellationTokenSource();
-            var processor = new PartitionProcessor(partition, channel.Reader, _committer, _dedupe, _dlq, _offsetSink!, _clock, _options,
-                _loggerFactory.CreateLogger<PartitionProcessor>());
+            var processor = new PartitionProcessor(partition, channel.Reader, _committer, _dedupe, _dlq, _offsetSink!, _observer, _clock,
+                _options, _loggerFactory.CreateLogger<PartitionProcessor>());
             var task = Task.Run(() => processor.RunAsync(abort.Token), CancellationToken.None);
             _workers[partition] = new PartitionWorker(channel, task, abort);
         }
