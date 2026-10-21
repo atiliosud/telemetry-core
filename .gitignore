@@ -1,0 +1,16 @@
+# Build output
+bin/
+obj/
+artifacts/
+TestResults/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+
+# Local secrets
+.env
+
+# Local tooling scratch
+.superpowers/
