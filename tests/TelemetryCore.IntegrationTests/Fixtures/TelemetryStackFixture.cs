@@ -167,6 +167,11 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
         await _producer!.ProduceAsync(topic, new Message<string?, byte[]?> { Key = key, Value = value });
     }
 
+    /// <summary>Freezes the Postgres container (docker pause): connections hang instead of failing; the mapped port is kept.</summary>
+    public Task PausePostgresAsync() => _postgres.PauseAsync();
+
+    public Task UnpausePostgresAsync() => _postgres.UnpauseAsync();
+
     public Task<bool> RedisKeyExistsAsync(string key) => _redisAdmin!.GetDatabase().KeyExistsAsync(key);
 
     public Task<TimeSpan?> RedisTimeToLiveAsync(string key) => _redisAdmin!.GetDatabase().KeyTimeToLiveAsync(key);

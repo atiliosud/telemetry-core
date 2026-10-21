@@ -16,5 +16,7 @@ public sealed class WorkerOptions
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);
     public string PostgresConnectionString { get; set; } = string.Empty;
     public string? RedisConnectionString { get; set; }
+    /// <summary>Kafka <c>session.timeout.ms</c>; null keeps the client default (45 s).</summary>
+    public int? SessionTimeoutMs { get; set; }
     public TimeSpan OutboxPollInterval { get; set; } = TimeSpan.FromMilliseconds(500);
 }

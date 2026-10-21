@@ -32,9 +32,11 @@ public sealed partial class PartitionProcessor
     private readonly WorkerOptions _options;
     private readonly ILogger _log;
     private readonly Tracing.LinkCollector _links = new();
+    private readonly IFaultInjector _faults;
+    private readonly Action? _onFatal;
 
     public PartitionProcessor(int partition, ChannelReader<PartitionMessage> reader, IBatchCommitter committer, IDedupeHint dedupe,
-        IDlqPublisher dlq, IOffsetSink offsets, IProcessingObserver observer, TimeProvider clock, WorkerOptions o, ILogger log)
+        IDlqPublisher dlq, IOffsetSink offsets, IProcessingObserver observer, TimeProvider clock, WorkerOptions o, ILogger log, IFaultInjector? faults = null, Action? onFatal = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(o.BatchSize, 1);
         _partition = partition;
@@ -47,6 +49,8 @@ public sealed partial class PartitionProcessor
         _clock = clock;
         _options = o;
         _log = log;
+        _faults = faults ?? new NoopFaultInjector();
+        _onFatal = onFatal;
     }
 
     /// <summary>Runs until the channel completes (remaining messages are flushed) or <paramref name="ct"/> is cancelled (nothing more is stored).</summary>
@@ -110,6 +114,12 @@ public sealed partial class PartitionProcessor
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             LogAborted(_log, _partition);
+        }
+        catch (SimulatedCrashException ex)
+        {
+            // Test hook (SPEC §16): die after the DB commit, before the offset is stored. The batch is replayed by the next owner.
+            LogSimulatedCrash(_log, ex, _partition);
+            _onFatal?.Invoke();
         }
         finally
         {
@@ -210,6 +220,7 @@ public sealed partial class PartitionProcessor
                 }
             }
 
+            await _faults.AfterDbCommitAsync(_partition, ct).ConfigureAwait(false);
             var duplicates = knownByHint + result.Duplicates;
             LogBatchCommitted(_log, _partition, count, result.Inserted, duplicates, lastOffset);
             span?.SetTag("inserted", result.Inserted);
@@ -357,6 +368,9 @@ public sealed partial class PartitionProcessor
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Partition {Partition}: processing observer failed; processing continues")]
     private static partial void LogObserverFailed(ILogger log, Exception ex, int partition);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "Partition {Partition}: simulated crash after the DB commit; the offset is not stored")]
+    private static partial void LogSimulatedCrash(ILogger log, Exception ex, int partition);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Partition {Partition}: processor aborted; the unstored batch will be replayed")]
     private static partial void LogAborted(ILogger log, int partition);

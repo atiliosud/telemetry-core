@@ -34,6 +34,9 @@ public sealed partial class IngestionService : BackgroundService
     private readonly TimeProvider _clock;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<IngestionService> _log;
+    private readonly IFaultInjector _faults;
+    private readonly IHostApplicationLifetime? _lifetime;
+    private volatile bool _crashed;
 
     // Touched only by the consume thread (loop + rebalance handlers, which librdkafka runs inside Consume/Close).
     private readonly Dictionary<int, PartitionWorker> _workers = new();
@@ -41,7 +44,7 @@ public sealed partial class IngestionService : BackgroundService
 
     public IngestionService(IOptions<WorkerOptions> options, IBatchCommitter committer, IDedupeHint dedupe, IDlqPublisher dlq,
         IProcessingObserver observer, ChannelDepthRegistry channels, VehicleStateCache cache, IngestionStatus status, TimeProvider clock,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory, IFaultInjector? faults = null, IHostApplicationLifetime? lifetime = null)
     {
         _options = options.Value;
         _committer = committer;
@@ -54,6 +57,20 @@ public sealed partial class IngestionService : BackgroundService
         _clock = clock;
         _loggerFactory = loggerFactory;
         _log = loggerFactory.CreateLogger<IngestionService>();
+        _faults = faults ?? new NoopFaultInjector();
+        _lifetime = lifetime;
+    }
+
+    /// <summary>
+    /// Test hook (SPEC §16): the next stop behaves like a killed process: processors are aborted (nothing more is stored),
+    /// no final offset commit, and the consumer is disposed without leaving the group. Earlier auto-commits stand.
+    /// </summary>
+    public void SimulateCrash() => _crashed = true;
+
+    private void OnFatal()
+    {
+        _crashed = true;
+        _lifetime?.StopApplication();
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) =>
@@ -150,6 +167,7 @@ public sealed partial class IngestionService : BackgroundService
             PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky,
             // Deliberate (D11): a DB outage longer than this stalls the loop on a full channel and triggers a rebalance.
             MaxPollIntervalMs = 300_000,
+            SessionTimeoutMs = _options.SessionTimeoutMs,
         };
 
         return new ConsumerBuilder<string, byte[]>(config)
@@ -180,7 +198,7 @@ public sealed partial class IngestionService : BackgroundService
             });
             var abort = new CancellationTokenSource();
             var processor = new PartitionProcessor(partition, channel.Reader, _committer, _dedupe, _dlq, _offsetSink!, _observer, _clock,
-                _options, _loggerFactory.CreateLogger<PartitionProcessor>());
+                _options, _loggerFactory.CreateLogger<PartitionProcessor>(), _faults, OnFatal);
             var task = Task.Run(() => processor.RunAsync(abort.Token), CancellationToken.None);
             _workers[partition] = new PartitionWorker(channel, task, abort);
             _channels.Register(partition, channel.Reader);
@@ -244,6 +262,12 @@ public sealed partial class IngestionService : BackgroundService
     /// <summary>Graceful stop (§7): stop consuming → drain channels → flush last batches → commit offsets → close.</summary>
     private async Task StopAllAsync(IConsumer<string, byte[]> consumer)
     {
+        if (_crashed)
+        {
+            await CrashStopAsync().ConfigureAwait(false);
+            return;
+        }
+
         var tasks = new List<Task>(_workers.Count);
         foreach (var worker in _workers.Values)
         {
@@ -289,6 +313,32 @@ public sealed partial class IngestionService : BackgroundService
         }
 
         LogStopped(_log);
+    }
+
+    /// <summary>Crash path: abort every processor, no drain, no commit, no Close (the caller's <c>using</c> disposes the consumer).</summary>
+    private async Task CrashStopAsync()
+    {
+        foreach (var worker in _workers.Values)
+        {
+            worker.Abort.Cancel();
+        }
+
+        try
+        {
+            await Task.WhenAll(_workers.Values.Select(w => w.Task)).WaitAsync(DrainTimeout).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            LogDrainTimeout(_log, _workers.Count);
+        }
+
+        foreach (var partition in _workers.Keys)
+        {
+            _channels.Unregister(partition);
+        }
+
+        _workers.Clear();
+        LogCrashStopped(_log);
     }
 
     private void CommitStored(IConsumer<string, byte[]> consumer)
@@ -349,6 +399,9 @@ public sealed partial class IngestionService : BackgroundService
 
     [LoggerMessage(Level = LogLevel.Critical, Message = "Consume loop crashed")]
     private static partial void LogLoopCrashed(ILogger log, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "Ingestion crashed (simulated); no final offset commit, consumer disposed without leaving the group")]
+    private static partial void LogCrashStopped(ILogger log);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Ingestion stopped; offsets committed and consumer closed")]
     private static partial void LogStopped(ILogger log);

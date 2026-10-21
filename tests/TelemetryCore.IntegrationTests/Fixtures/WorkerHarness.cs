@@ -65,6 +65,13 @@ public sealed class WorkerHarness : IAsyncDisposable
         }
     }
 
+    /// <summary>Simulated process kill: processors aborted, no final offset commit, consumer disposed without leaving the group.</summary>
+    public async Task CrashAsync()
+    {
+        _app.Services.GetRequiredService<TelemetryCore.Worker.Ingestion.IngestionService>().SimulateCrash();
+        await StopAsync();
+    }
+
     public async ValueTask DisposeAsync()
     {
         await StopAsync();

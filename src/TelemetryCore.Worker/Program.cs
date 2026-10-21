@@ -70,7 +70,9 @@ public static class Program
         services.AddSingleton<IProcessingObserver>(sp => sp.GetRequiredService<TelemetryMetrics>());
         services.AddSingleton<IDedupeHint>(CreateDedupeHint);
         services.AddSingleton<IDlqPublisher, KafkaDlqPublisher>();
-        services.AddHostedService<IngestionService>();
+        services.AddSingleton<IFaultInjector, NoopFaultInjector>();
+        services.AddSingleton<IngestionService>();
+        services.AddHostedService(sp => sp.GetRequiredService<IngestionService>());
         // Bulkhead (SPEC §7): the outbox gets its own pool of at most 4 connections, apart from the ingestion pool.
         services.AddHostedService(sp => new OutboxPublisher(sp.GetRequiredService<WorkerOptions>(),
             NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(sp.GetRequiredService<WorkerOptions>().PostgresConnectionString)
