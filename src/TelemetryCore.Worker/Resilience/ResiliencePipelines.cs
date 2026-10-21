@@ -13,7 +13,7 @@ public static partial class ResiliencePipelines
 
     /// <summary>
     /// PostgreSQL batch write: Retry 3x exponential + jitter (outer) → circuit breaker 50 % / 30 s / min 20 / break 15 s →
-    /// timeout 2 s per attempt (inner). Cancellation by the caller (shutdown, drain abort) is never retried.
+    /// timeout 2 s per attempt (inner). Cancellation by the caller (shutdown, drain abort) and an open circuit are never retried.
     /// Breaker transitions are published to <paramref name="tracker"/> (metrics gauge and readiness).
     /// </summary>
     public static ResiliencePipeline CreateDatabase(CircuitStateTracker tracker, ILogger log, TimeProvider? time = null)
@@ -33,7 +33,9 @@ public static partial class ResiliencePipelines
                 BackoffType = DelayBackoffType.Exponential,
                 UseJitter = true,
                 Delay = TimeSpan.FromMilliseconds(200),
-                ShouldHandle = args => ValueTask.FromResult(IsFailure(args.Outcome.Exception, args.Context.CancellationToken)),
+                // An open circuit is not retried here: it would only burn the retries; the processor keeps the batch (D11).
+                ShouldHandle = args => ValueTask.FromResult(args.Outcome.Exception is not BrokenCircuitException
+                    && IsFailure(args.Outcome.Exception, args.Context.CancellationToken)),
                 OnRetry = args =>
                 {
                     LogRetry(log, args.Outcome.Exception, args.AttemptNumber + 1, args.RetryDelay.TotalMilliseconds);

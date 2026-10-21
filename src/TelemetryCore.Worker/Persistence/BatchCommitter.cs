@@ -86,12 +86,15 @@ public sealed class BatchCommitter : IBatchCommitter
 
             await _repository.UpsertStatesAsync(conn, tx, touched.Values, ct).ConfigureAwait(false);
             await _repository.InsertAlertsAndOutboxAsync(conn, tx, outcome.Alerts, ct).ConfigureAwait(false);
-            await CommitTransactionAsync(tx, ct).ConfigureAwait(false);
+            // COMMIT never gets the attempt token: a timeout firing during COMMIT would leave the outcome unknown
+            // (committed on the server, error on the client) and the retry would count the whole batch as duplicates.
+            // COMMIT is still bounded by the Npgsql command timeout.
+            await CommitTransactionAsync(tx, CancellationToken.None).ConfigureAwait(false);
             _cache.Publish(touched.Values);
         }
         else
         {
-            await CommitTransactionAsync(tx, ct).ConfigureAwait(false);
+            await CommitTransactionAsync(tx, CancellationToken.None).ConfigureAwait(false);
         }
 
         return new PersistResult(outcome.Inserted, outcome.Duplicates, outcome.OutOfOrderIds?.Count ?? 0, outcome.GpsJumps, outcome.Alerts);

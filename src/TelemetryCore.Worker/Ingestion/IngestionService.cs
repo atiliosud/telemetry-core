@@ -103,6 +103,13 @@ public sealed partial class IngestionService : BackgroundService
                     continue;
                 }
 
+                if (!_workers.TryGetValue(result.Partition.Value, out var worker))
+                {
+                    // Not ours any more; the offset is not stored, so the owner replays it.
+                    LogUnknownPartition(_log, result.Partition.Value, result.Offset.Value);
+                    continue;
+                }
+
                 try
                 {
                     _observer.OnConsumed();
@@ -110,13 +117,6 @@ public sealed partial class IngestionService : BackgroundService
                 catch (Exception ex)
                 {
                     LogObserverFailed(_log, ex);
-                }
-
-                if (!_workers.TryGetValue(result.Partition.Value, out var worker))
-                {
-                    // Not ours any more; the offset is not stored, so the owner replays it.
-                    LogUnknownPartition(_log, result.Partition.Value, result.Offset.Value);
-                    continue;
                 }
 
                 var msg = new PartitionMessage(result.Partition.Value, result.Offset.Value, result.Message.Key, result.Message.Value,

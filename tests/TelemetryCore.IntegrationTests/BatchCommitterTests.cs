@@ -14,6 +14,41 @@ public sealed class BatchCommitterTests
     public BatchCommitterTests(TelemetryStackFixture stack) => _stack = stack;
 
     [Fact]
+    public async Task AttemptTokenCancelledAtCommit_StillCommits_WithCorrectCounts()
+    {
+        var vehicle = TelemetryStackFixture.UniqueName("veh");
+        var t0 = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var events = new[]
+        {
+            Evt(vehicle, 1, t0, 40.0000, -3.0000),
+            Evt(vehicle, 3, t0.AddSeconds(2), 40.0002, -3.0000),
+            Evt(vehicle, 2, t0.AddSeconds(1), 40.0001, -3.0000), // out of order
+        };
+
+        await using var dataSource = NpgsqlDataSource.Create(_stack.WorkerConnectionString);
+        using var attempt = new CancellationTokenSource();
+        var cache = new VehicleStateCache();
+        var committer = new BatchCommitter(dataSource, new TelemetryRepository(), cache)
+        {
+            // The per-attempt timeout (Polly, 2 s) fires exactly when COMMIT is about to be sent.
+            CommitTransactionAsync = (tx, ct) =>
+            {
+                attempt.Cancel();
+                return tx.CommitAsync(ct);
+            },
+        };
+
+        var result = await committer.CommitAsync(events, 0, attempt.Token);
+
+        result.Inserted.Should().Be(3, "a timeout must not turn COMMIT into an ambiguous outcome");
+        result.OutOfOrder.Should().Be(1);
+        (await _stack.CountRowsAsync("processed_events", vehicle)).Should().Be(3);
+        (await _stack.GetStateAsync(vehicle))!.LastSeq.Should().Be(3);
+        cache.TryGet(vehicle, out var cached).Should().BeTrue("the batch committed, so its state is published");
+        cached.LastSeq.Should().Be(3);
+    }
+
+    [Fact]
     public async Task AmbiguousCommit_EvictsCache_NextBatchUsesDatabaseState()
     {
         var vehicle = TelemetryStackFixture.UniqueName("veh");

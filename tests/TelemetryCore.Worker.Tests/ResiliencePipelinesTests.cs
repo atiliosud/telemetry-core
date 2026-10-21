@@ -114,6 +114,24 @@ public sealed class ResiliencePipelinesTests
     }
 
     [Fact]
+    public async Task DbPipeline_DoesNotRetryBrokenCircuit()
+    {
+        var pipeline = ResiliencePipelines.CreateDatabase(_tracker, NullLogger.Instance, _clock);
+        for (var i = 0; i < 6; i++)
+        {
+            var fail = () => RunAsync<int>(pipeline, _ => throw new InvalidOperationException("down"));
+            await fail.Should().ThrowAsync<Exception>();
+        }
+
+        _tracker.State.Should().Be(1);
+        var before = _clock.GetUtcNow();
+        var act = () => pipeline.ExecuteAsync<int>(_ => ValueTask.FromResult(0), CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        await act.Should().ThrowAsync<BrokenCircuitException>();
+        _clock.GetUtcNow().Should().Be(before, "an open circuit fails at once: no retry delays (the processor's D11 loop retries)");
+    }
+
+    [Fact]
     public async Task DbPipeline_HalfOpensAfter15s_AndClosesOnSuccess()
     {
         var pipeline = ResiliencePipelines.CreateDatabase(_tracker, NullLogger.Instance, _clock);
