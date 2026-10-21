@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\TelemetryCore.Contracts\TelemetryCore.Contracts.csproj" />
+    <ProjectReference Include="..\TelemetryCore.Domain\TelemetryCore.Domain.csproj" />
+  </ItemGroup>
+</Project>

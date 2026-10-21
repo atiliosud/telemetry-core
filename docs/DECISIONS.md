@@ -67,3 +67,7 @@ A DLQ message is produced before the offset is stored. A crash between the two c
 - FluentAssertions is pinned to 7.x (Apache-2.0); version 8 changed to a commercial license.
 - Central package management (`Directory.Packages.props`).
 - Kafka runs in KRaft mode with the official `apache/kafka` image.
+- Pinned versions (latest stable supporting net8.0 at scaffold time): Confluent.Kafka 2.16.0, StackExchange.Redis 3.4.5, Npgsql 10.0.3, Dapper 2.1.89, Polly.Core and Polly.RateLimiting 8.8.0, OpenTelemetry packages 1.20.1 (Prometheus exporter 1.20.1-beta.1, prerelease only), Serilog.AspNetCore 10.0.0, Serilog.Formatting.Compact 3.0.0, Microsoft.Extensions.TimeProvider.Testing 10.11.0, Microsoft.AspNetCore.Mvc.Testing 8.0.32, xunit 2.9.3, xunit.runner.visualstudio 3.1.5, Microsoft.NET.Test.Sdk 18.11.0, coverlet.collector 10.1.0, FluentAssertions 7.2.2, Testcontainers (+PostgreSql, Redis, Kafka) 4.16.0.
+
+### D19. Two extra test projects
+The spec (section 14) lists only `Domain.Tests` and `IntegrationTests`. Two small projects are added: `LoadGenerator.Tests` keeps the generator logic (planning, deterministic seeds) under fast unit tests, and `Worker.Tests` covers processor batching and flush behaviour with fakes, without Docker. Slow, container-based checks stay in `IntegrationTests`.

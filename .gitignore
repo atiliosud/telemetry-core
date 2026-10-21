@@ -14,3 +14,8 @@ TestResults/
 
 # Local tooling scratch
 .superpowers/
+
+# .NET
+*.rsp
+*.nupkg
+.dotnet/
