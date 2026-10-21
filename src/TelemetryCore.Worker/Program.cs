@@ -7,6 +7,7 @@ using TelemetryCore.Worker.Dlq;
 using TelemetryCore.Worker.Health;
 using TelemetryCore.Worker.Ingestion;
 using TelemetryCore.Worker.Observability;
+using TelemetryCore.Worker.Outbox;
 using TelemetryCore.Worker.Persistence;
 using TelemetryCore.Worker.Resilience;
 
@@ -64,6 +65,13 @@ public static class Program
         services.AddSingleton<IDedupeHint>(CreateDedupeHint);
         services.AddSingleton<IDlqPublisher, KafkaDlqPublisher>();
         services.AddHostedService<IngestionService>();
+        // Bulkhead (SPEC §7): the outbox gets its own pool of at most 4 connections, apart from the ingestion pool.
+        services.AddHostedService(sp => new OutboxPublisher(sp.GetRequiredService<WorkerOptions>(),
+            NpgsqlDataSource.Create(new NpgsqlConnectionStringBuilder(sp.GetRequiredService<WorkerOptions>().PostgresConnectionString)
+            {
+                MaxPoolSize = 4,
+                ApplicationName = "telemetry-worker-outbox",
+            }.ConnectionString), sp.GetRequiredService<ILogger<OutboxPublisher>>()));
         services.AddHealthChecks().AddCheck<ReadinessCheck>("readiness", tags: new[] { ReadinessCheck.Tag });
         services.AddOpenTelemetry().WithMetrics(metrics => metrics
             .AddMeter(TelemetryMetrics.MeterName)
