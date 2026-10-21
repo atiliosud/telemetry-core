@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <ItemGroup>
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Dapper" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\TelemetryCore.Contracts\TelemetryCore.Contracts.csproj" />
   </ItemGroup>
 </Project>
