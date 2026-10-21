@@ -1,6 +1,7 @@
 # Stops the local stack. Volumes are kept unless -Purge is given (which also deletes the Postgres data).
 param([switch]$Purge)
-$ErrorActionPreference = 'Stop'
+# Continue, not Stop: Windows PowerShell 5.1 turns docker's stderr progress into terminating errors under Stop. Native failures are checked via $LASTEXITCODE.
+$ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 $envFile = Join-Path $root '.env'
 if (-not (Test-Path $envFile)) { $envFile = Join-Path $root '.env.example' }
