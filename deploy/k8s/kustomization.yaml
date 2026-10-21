@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: telemetry-core
+resources:
+  - namespace.yaml
+  - worker-deployment.yaml
+  - worker-service.yaml
+  - readapi-deployment.yaml
+  - readapi-service.yaml
+  - keda-scaledobject.yaml
+# secrets.example.yaml is intentionally NOT listed: create the real Secret out-of-band.

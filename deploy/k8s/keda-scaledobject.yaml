@@ -1,0 +1,21 @@
+# Requires KEDA installed in the cluster. KEDA creates and drives a HorizontalPodAutoscaler
+# under the hood (HPA on external metrics). Consumer lag is the right signal because CPU does
+# not reflect backlog: a worker blocked on the database can be idle on CPU while lag grows.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  namespace: telemetry-core
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 1
+  maxReplicaCount: 12 # = partitions of telemetry.raw; extra consumers would sit idle
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka:9092 # replace with your Kafka bootstrap address
+        consumerGroup: telemetry-worker
+        topic: telemetry.raw
+        lagThreshold: "1000"
+        offsetResetPolicy: earliest

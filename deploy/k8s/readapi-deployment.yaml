@@ -1,0 +1,88 @@
+# Stateless HTTP API: rolling update with maxUnavailable 0. Canary/blue-green would be layered
+# at the Service/Ingress level (a second Deployment with a different version label plus weighted
+# routing via ingress or a service mesh); safe here because the API holds no consumer state.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: read-api
+  namespace: telemetry-core
+  labels:
+    app: read-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: read-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: read-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1654
+        runAsGroup: 1654
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: read-api
+          image: telemetry-core/read-api:latest # replace with your registry tag
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ReadApi__PostgresConnectionString
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-core-secrets
+                  key: reader-db-connection
+            - name: TELEMETRY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-core-secrets
+                  key: api-key
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1654
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

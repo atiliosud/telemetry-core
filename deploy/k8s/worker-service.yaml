@@ -1,0 +1,15 @@
+# Exposes health/metrics of the worker inside the cluster (the worker has no public API).
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: telemetry-core
+  labels:
+    app: worker
+spec:
+  selector:
+    app: worker
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

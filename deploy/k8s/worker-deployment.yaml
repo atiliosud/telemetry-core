@@ -1,0 +1,99 @@
+# Release strategy: RollingUpdate with maxUnavailable 0 + graceful drain (preStop + SIGTERM;
+# the worker drains up to 15 s, host shutdown timeout 25 s) is the zero-downtime path.
+# All versions of a Kafka consumer share the group `telemetry-worker`, so a canary Deployment
+# using the same group simply takes a share of the partitions (and causes a rebalance).
+# A blue/green stack with its OWN consumer group would consume every message twice, so it is
+# only safe with idempotent writes or a separate target; it is not a drop-in pattern here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: telemetry-core
+  labels:
+    app: worker
+spec:
+  replicas: 2 # KEDA (keda-scaledobject.yaml) manages the count once applied
+  selector:
+    matchLabels:
+      app: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1654
+        runAsGroup: 1654
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: telemetry-core/worker:latest # replace with your registry tag
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DOTNET_gcServer
+              value: "1"
+            - name: Worker__BootstrapServers
+              value: kafka:9092 # replace with your Kafka bootstrap address
+            - name: Worker__PostgresConnectionString
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-core-secrets
+                  key: worker-db-connection
+            - name: Worker__RedisConnectionString
+              valueFrom:
+                secretKeyRef:
+                  name: telemetry-core-secrets
+                  key: redis-connection
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"] # let endpoints settle before SIGTERM
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1654
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
