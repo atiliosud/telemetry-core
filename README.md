@@ -1,40 +1,158 @@
 # Telemetry Core
 
-A generic portfolio project: the ingestion core of a vehicle telemetry platform, built with .NET 8.
-A worker consumes telemetry events from Kafka, validates them, applies business rules (out-of-order detection, GPS
-jumps, daily distance, speeding alerts) and persists them idempotently to PostgreSQL, with Redis as a dedupe hint,
-a dead-letter topic for poison messages, Polly resilience policies and Prometheus metrics.
+A .NET 8 proof of concept that ingests high-volume vehicle fleet telemetry from Kafka into PostgreSQL with
+**per-vehicle ordering, no loss, no double counting and crash safety**. It includes a resilience layer, a
+transactional outbox, a read API, full observability, Docker Compose and Kubernetes/KEDA manifests.
 
-- Specification: [SPEC.md](SPEC.md)
-- Design decisions and deviations from the spec: [docs/DECISIONS.md](docs/DECISIONS.md)
+## The problem
+
+A fleet sends position and speed events continuously. The pipeline must:
+
+- keep the order of events of each vehicle (out-of-order and GPS-jump detection depend on it);
+- never lose an event, even when the worker, database, Redis or Kafka fails;
+- never count an event twice, even though Kafka delivers at-least-once and producers resend;
+- raise alerts (for example speeding) exactly once per triggering event;
+- keep up with load, and show a lag/backpressure signal instead of dropping data.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    GEN[Load generator] -->|key = vehicleId| RAW[(Kafka telemetry.raw<br/>12 partitions)]
+    RAW --> CONS[Consume loop]
+    CONS -->|bounded channel per partition| PROC[Partition processor<br/>one per partition]
+    PROC -->|batch transaction| PG[(PostgreSQL)]
+    PROC -.->|post-commit hint| REDIS[(Redis)]
+    PROC -->|poison messages| DLQ[(telemetry.dlq)]
+    PG --> OUT[Outbox publisher]
+    OUT --> ALERTS[(telemetry.alerts)]
+    PG --> API[Read API<br/>X-Api-Key]
+    PROC --> OBS[Metrics / traces / logs]
+    OBS --> PROM[Prometheus] --> GRAF[Grafana]
+    OBS --> JAE[Jaeger]
+```
+
+ASCII fallback:
+
+```
+generator -> Kafka telemetry.raw (key = vehicleId, 12 partitions)
+          -> consume loop -> bounded channel per partition -> one processor per partition
+          -> batch transaction in PostgreSQL (events, state, alerts, outbox)
+          -> outbox publisher -> Kafka telemetry.alerts
+   poison messages -> telemetry.dlq        Redis = post-commit hint only
+   PostgreSQL -> Read API (X-Api-Key)      metrics -> Prometheus -> Grafana, traces -> Jaeger
+```
+
+More detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Key features
+
+- Per-vehicle ordering: Kafka key = vehicle id, one processor per partition.
+- Idempotency by the database primary key on `processed_events`; Redis is only a hint (D1).
+- Batch transactions: events, vehicle state, alerts and outbox rows commit together.
+- Offsets stored only after the DB commit (and DLQ publish).
+- Business rules: out-of-order detection, GPS jumps, daily distance, speeding alerts.
+- Resilience (Polly): retry with jitter, circuit breaker, timeouts, bulkhead; backpressure through bounded channels.
+- Transactional outbox for alert publishing (at-least-once).
+- Dead-letter topic for invalid messages.
+- Read API (`/vehicles/{vehicleId}/state`, `/alerts`) with API-key auth, rate limiting and a read-only DB role.
+- Observability: Prometheus metrics, OpenTelemetry traces with span links, structured logs, Grafana dashboard.
+- Graceful shutdown; Docker Compose stack; Kubernetes manifests with KEDA lag-based autoscaling.
 
 ## Quick start
 
 Prerequisites: .NET 8 SDK or newer, Docker Desktop, git.
 
 ```powershell
-scripts\up.ps1                    # Kafka, Redis, Postgres and the worker (Docker Compose); builds the images
-scripts\demo.ps1 -Total 100000    # sends 100,000 events with injected faults and checks the numbers
-scripts\down.ps1                  # stop (add -Purge to also delete the database volume)
+scripts\up.ps1                    # builds and starts the whole stack (Docker Compose)
+scripts\demo.ps1 -Total 100000    # load with injected faults, then checks the numbers
+scripts\down.ps1                  # stop (add -Purge to delete the database volume)
 ```
 
-On Linux/macOS use `scripts/up.sh`, `scripts/demo.sh --total 100000` and `scripts/down.sh`.
+Linux/macOS: `./scripts/up.sh`, `./scripts/demo.sh --total 100000`, `./scripts/down.sh`.
 The first `up` creates `.env` from `.env.example` (local demo values only).
 
-The demo runs the load generator (2% duplicates, 1% out-of-order, 0.5% invalid events by default) and then compares
-what was injected with what the worker counted: unique rows in `processed_events`, and the
-`telemetry_duplicates_total`, `telemetry_out_of_order_total` and `telemetry_dlq_total` counters from the worker's
-metrics endpoint. It prints `PASS` only when every number matches, and saves the output under `artifacts/`.
+| Service | URL |
+|---|---|
+| Grafana | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Jaeger | http://localhost:16686 |
+| Read API | http://localhost:8080 (send the `X-Api-Key` header; local value in `.env`, `TELEMETRY_API_KEY`) |
+| Worker metrics | http://localhost:8081/metrics (health: `/health/live`, `/health/ready`) |
 
-Worker endpoints (local only):
+Example: `curl -H "X-Api-Key: <key>" http://localhost:8080/alerts`
 
-- Metrics: http://localhost:8081/metrics
-- Health: http://localhost:8081/health/live and http://localhost:8081/health/ready
-
-## Tests
+## Testing
 
 ```powershell
-dotnet test TelemetryCore.sln     # unit tests + integration tests (Testcontainers: needs Docker running)
+dotnet test TelemetryCore.sln        # unit + integration (integration needs Docker running)
+scripts\demo.ps1                     # end-to-end load demo, prints PASS only if every number matches
+scripts\chaos.ps1                    # planned: failure scenarios <!-- VERIFY -->
+scripts\verify-security.ps1          # container hardening and secret checks
+scripts\verify-infra.ps1             # smoke check of topics, Redis, Postgres roles
+```
+
+Details in [docs/TESTING.md](docs/TESTING.md).
+
+## Measured results
+
+Local laptop measurements, single-node Kafka. Not a benchmark.
+
+| Metric | Value |
+|---|---|
+| Machine | <!-- MEASURED: CPU / RAM / OS --> |
+| Events sent | <!-- MEASURED: total --> |
+| Sustained throughput (events/s) | <!-- MEASURED: events/s --> |
+| p95 processing latency | <!-- MEASURED: seconds --> |
+| p95 batch duration | <!-- MEASURED: seconds --> |
+| Duplicates detected vs injected | <!-- MEASURED: counted / injected --> |
+| Out-of-order detected vs injected | <!-- MEASURED: counted / injected --> |
+| DLQ messages vs invalid injected | <!-- MEASURED: counted / injected --> |
+| Recovery after worker kill | <!-- MEASURED: seconds, rows lost/duplicated --> |
+| Recovery after DB outage | <!-- MEASURED: seconds, circuit behavior --> |
+
+## Design decisions
+
+All in [docs/DECISIONS.md](docs/DECISIONS.md). Highlights:
+
+- The database is the source of truth for idempotency; Redis is only a post-commit hint (D1).
+- Rules run on working copies; memory is updated only after commit (D5).
+- Offsets stored after DB commit, with periodic client commit (D9); partition revoke drains synchronously (D10).
+- Batches are kept and retried while the circuit is open, producing backpressure (D11).
+- Least-privilege DB users (D13); traces in Jaeger with span links (D14); lag from `kafka-exporter` (D15).
+- Raw Npgsql with `unnest` in the worker, Dapper in the Read API (D20).
+- `COMMIT` has no attempt timeout; failed commits evict cache state (D21, D22).
+- Outbox cancels a batch only on broker-unavailable errors (D24).
+- Kubernetes shutdown budget and KEDA ceiling (D28).
+
+## Limitations
+
+- Single-node Kafka (KRaft) and single Postgres; no replication or failover is demonstrated.
+- Measurements come from a local laptop and are not representative of production.
+- API-key authentication only; there is no real identity provider.
+- The DLQ is at-least-once (D17); duplicates in the DLQ are possible.
+- A database outage longer than `max.poll.interval.ms` (5 min) triggers a rebalance (D11); pausing partitions would be the next step.
+- Poison outbox rows are retried forever (no outbox DLQ or attempt limit).
+- Kubernetes manifests were validated offline but not run on a cluster.
+- Only the `SPEEDING` alert is implemented.
+
+## Repository structure
+
+```
+src/
+  TelemetryCore.Contracts/      DTOs, topic names, headers
+  TelemetryCore.Domain/         validation and business rules (no I/O)
+  TelemetryCore.Worker/         ingestion, persistence, resilience, outbox, observability
+  TelemetryCore.ReadApi/        read endpoints, API-key middleware
+  TelemetryCore.LoadGenerator/  fleet simulator with fault injection
+tests/
+  TelemetryCore.Domain.Tests/ Worker.Tests/ LoadGenerator.Tests/ IntegrationTests/
+db/                             roles and schema (init scripts)
+deploy/
+  docker-compose.yml  prometheus/  grafana/  k8s/
+scripts/                        up, down, demo, verify-infra, verify-security
+docs/                           ARCHITECTURE.md, TESTING.md, DECISIONS.md
+SPEC.md
 ```
 
 ## License

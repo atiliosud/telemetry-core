@@ -71,3 +71,32 @@ A DLQ message is produced before the offset is stored. A crash between the two c
 
 ### D19. Two extra test projects
 The spec (section 14) lists only `Domain.Tests` and `IntegrationTests`. Two small projects are added: `LoadGenerator.Tests` keeps the generator logic (planning, deterministic seeds) under fast unit tests, and `Worker.Tests` covers processor batching and flush behaviour with fakes, without Docker. Slow, container-based checks stay in `IntegrationTests`.
+
+## Hardening decisions
+
+### D20. Raw Npgsql with array parameters in the worker; Dapper in the Read API
+Batch writes use Npgsql directly with typed array parameters and `unnest(...)`, so one batch is a handful of statements regardless of size and column types stay explicit. The Read API runs simple read queries, where Dapper is enough.
+
+### D21. COMMIT ignores the attempt timeout
+Statements before `COMMIT` keep the 2 s attempt timeout, but `COMMIT` runs without that token. A timeout fired during `COMMIT` would leave the outcome unknown; without it, the commit either succeeds or fails on a real connection error.
+
+### D22. Ambiguous or failed commits evict the batch's vehicles from the cache
+After any failed or ambiguous commit, the vehicles of that batch are dropped from the in-memory cache and reloaded from `vehicle_state` on the next attempt. The cache also accepts only newer state (a `LastSeq` guard), so a zombie writer (a former owner of the partition finishing late) cannot overwrite fresher state.
+
+### D23. Retry does not retry `BrokenCircuitException`
+An open circuit means the database is known to be unavailable; the processor's keep-and-retry loop (D11) already waits and retries, so the Polly retry would only add noise.
+
+### D24. Outbox cancels a publish batch only when the broker is unavailable
+Broker-unavailable errors cancel the rest of the batch (every other send would fail the same way). Any other per-row failure leaves that row pending and does not block the others.
+
+### D25. `max.poll.interval.ms` is set explicitly to 300000
+It is the Kafka client default, written down so the limit in D11 is visible in configuration and not implicit.
+
+### D26. Load generator `--vehicle-prefix`
+Repeated runs would otherwise reuse vehicle ids and sequence numbers, and the second run would be seen as old data. The demo script passes a fresh prefix on every run.
+
+### D27. Kafka image pinned to `apache/kafka:3.9.0`
+A moving tag can change broker behavior between runs; the pinned version keeps the demo reproducible.
+
+### D28. Kubernetes shutdown budget, startup probe and KEDA ceiling
+`preStop` (2 s) plus the host's 25 s shutdown timeout fits in the 30 s `terminationGracePeriodSeconds`. A `startupProbe` protects slow starts from the liveness probe. KEDA `maxReplicaCount` is 12, equal to the partitions of `telemetry.raw`; more consumers would sit idle.
