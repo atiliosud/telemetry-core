@@ -25,6 +25,16 @@ public class GeneratorOptionsTests
         o.Seed.Should().Be(42);
         o.Bootstrap.Should().Be("localhost:29092");
         o.Topic.Should().Be("telemetry.raw");
+        o.VehiclePrefix.Should().Be("VH-");
+    }
+
+    [Fact]
+    public void Parse_VehiclePrefix_AcceptsShortSafeValue_RejectsOthers()
+    {
+        GeneratorOptions.Parse(new[] { "--vehicle-prefix", "R20261021-" }).VehiclePrefix.Should().Be("R20261021-");
+        ((Action)(() => GeneratorOptions.Parse(new[] { "--vehicle-prefix", "" }))).Should().Throw<ArgumentException>();
+        ((Action)(() => GeneratorOptions.Parse(new[] { "--vehicle-prefix", "has space" }))).Should().Throw<ArgumentException>();
+        ((Action)(() => GeneratorOptions.Parse(new[] { "--vehicle-prefix", new string('x', 33) }))).Should().Throw<ArgumentException>();
     }
 
     [Theory]

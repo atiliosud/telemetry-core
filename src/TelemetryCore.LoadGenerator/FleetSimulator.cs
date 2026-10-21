@@ -22,7 +22,7 @@ public sealed class FleetSimulator
     private readonly Vehicle[] _vehicles;
     private readonly Random _rng;
 
-    public FleetSimulator(int vehicles, int speedingVehicles, Random rng)
+    public FleetSimulator(int vehicles, int speedingVehicles, Random rng, string vehiclePrefix = "VH-")
     {
         _rng = rng;
         _vehicles = new Vehicle[vehicles];
@@ -32,7 +32,7 @@ public sealed class FleetSimulator
             var a = rng.NextDouble() * 2 * Math.PI;
             _vehicles[i] = new Vehicle
             {
-                Id = $"VH-{i + 1:D6}",
+                Id = $"{vehiclePrefix}{i + 1:D6}",
                 Lat = MadridLat + r * Math.Cos(a) / MetersPerDegLat,
                 Lon = MadridLon + r * Math.Sin(a) / (MetersPerDegLat * Math.Cos(MadridLat * Math.PI / 180)),
                 HeadingRad = rng.NextDouble() * 2 * Math.PI,

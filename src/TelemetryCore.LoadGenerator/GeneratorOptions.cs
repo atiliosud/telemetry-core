@@ -14,6 +14,8 @@ public sealed class GeneratorOptions
     public int Seed { get; init; } = 42;
     public string Bootstrap { get; init; } = "localhost:29092";
     public string Topic { get; init; } = "telemetry.raw";
+    /// <summary>Vehicle ids are <c>{prefix}{n:D6}</c>. A fresh prefix per run gives fresh vehicles (seq restarts at 1 without clashing with stored state).</summary>
+    public string VehiclePrefix { get; init; } = "VH-";
 
     public static GeneratorOptions Parse(string[] args)
     {
@@ -27,6 +29,7 @@ public sealed class GeneratorOptions
         var seed = 42;
         var bootstrap = "localhost:29092";
         var topic = "telemetry.raw";
+        var vehiclePrefix = "VH-";
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -55,6 +58,11 @@ public sealed class GeneratorOptions
                     if (string.IsNullOrWhiteSpace(value)) throw new ArgumentException("--topic must not be empty.");
                     topic = value;
                     break;
+                case "--vehicle-prefix":
+                    if (value.Length is 0 or > 32 || !value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
+                        throw new ArgumentException("--vehicle-prefix expects 1-32 characters [A-Za-z0-9_-].");
+                    vehiclePrefix = value;
+                    break;
                 default:
                     throw new ArgumentException($"Unknown flag '{flag}'.");
             }
@@ -72,6 +80,7 @@ public sealed class GeneratorOptions
             Seed = seed,
             Bootstrap = bootstrap,
             Topic = topic,
+            VehiclePrefix = vehiclePrefix,
         };
     }
 

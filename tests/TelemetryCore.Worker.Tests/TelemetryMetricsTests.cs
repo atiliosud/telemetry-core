@@ -1,0 +1,82 @@
+using System.Diagnostics.Metrics;
+using FluentAssertions;
+using Microsoft.Extensions.DependencyInjection;
+using TelemetryCore.Worker.Observability;
+using TelemetryCore.Worker.Resilience;
+
+namespace TelemetryCore.Worker.Tests;
+
+public sealed class TelemetryMetricsTests : IDisposable
+{
+    private readonly ServiceProvider _services = new ServiceCollection().AddMetrics().BuildServiceProvider();
+    private readonly CircuitStateTracker _tracker = new();
+    private readonly TelemetryMetrics _metrics;
+    private readonly MeterListener _listener = new();
+    private readonly Dictionary<string, long> _totals = new();
+
+    public TelemetryMetricsTests()
+    {
+        _metrics = new TelemetryMetrics(_services.GetRequiredService<IMeterFactory>(), _tracker);
+        _listener.InstrumentPublished = (instrument, listener) =>
+        {
+            if (instrument.Meter.Name == TelemetryMetrics.MeterName && instrument.Meter.Scope == _services.GetRequiredService<IMeterFactory>())
+            {
+                listener.EnableMeasurementEvents(instrument);
+            }
+        };
+        _listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) => Record(instrument.Name, value, tags));
+        _listener.SetMeasurementEventCallback<int>((instrument, value, tags, _) => Record(instrument.Name, value, tags));
+        _listener.Start();
+    }
+
+    [Fact]
+    public void Counters_UseSpecNames_AndObserverMapping()
+    {
+        _metrics.OnConsumed();
+        _metrics.OnConsumed();
+        _metrics.OnBatchCommitted(partition: 1, inserted: 10, duplicates: 2, outOfOrder: 3, gpsJumps: 4, alerts: 5);
+        _metrics.OnDlq("invalid_json");
+        _metrics.OnDlq("invalid_json");
+        _metrics.OnDlq("lat_out_of_range");
+        _metrics.OnRedisFallback();
+
+        _totals["telemetry_events_consumed"].Should().Be(2);
+        _totals["telemetry_events_processed"].Should().Be(10);
+        _totals["telemetry_duplicates"].Should().Be(2);
+        _totals["telemetry_out_of_order"].Should().Be(3);
+        _totals["telemetry_gps_jumps"].Should().Be(4);
+        _totals["telemetry_alerts_raised|type=SPEEDING"].Should().Be(5);
+        _totals["telemetry_dlq|reason=invalid_json"].Should().Be(2);
+        _totals["telemetry_dlq|reason=lat_out_of_range"].Should().Be(1);
+        _totals["telemetry_redis_fallback"].Should().Be(1);
+    }
+
+    [Fact]
+    public void CircuitGauge_ReportsTrackerState()
+    {
+        _tracker.Set(1);
+        _listener.RecordObservableInstruments();
+
+        _totals["telemetry_circuit_breaker_state"].Should().Be(1);
+    }
+
+    public void Dispose()
+    {
+        _listener.Dispose();
+        _services.Dispose();
+    }
+
+    private void Record(string name, long value, ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        var key = name;
+        foreach (var tag in tags)
+        {
+            key += "|" + tag.Key + "=" + tag.Value;
+        }
+
+        lock (_totals)
+        {
+            _totals[key] = (_totals.TryGetValue(key, out var v) ? v : 0) + value;
+        }
+    }
+}

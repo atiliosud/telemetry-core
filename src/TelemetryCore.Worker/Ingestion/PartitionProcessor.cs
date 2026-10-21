@@ -127,8 +127,7 @@ public sealed partial class PartitionProcessor
             try
             {
                 await _dlq.PublishAsync(msg, reason!, ct).ConfigureAwait(false);
-                _observer.OnDlq(reason!);
-                return count;
+                break;
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
@@ -136,6 +135,18 @@ public sealed partial class PartitionProcessor
                 await Task.Delay(RetryDelay, _clock, ct).ConfigureAwait(false);
             }
         }
+
+        // Outside the retry loop: an observer failure must never republish the message.
+        try
+        {
+            _observer.OnDlq(reason!);
+        }
+        catch (Exception ex)
+        {
+            LogObserverFailed(_log, ex, _partition);
+        }
+
+        return count;
     }
 
     private async Task FlushAsync(TelemetryEvent[] buffer, int count, long lastOffset, CancellationToken ct)
@@ -152,7 +163,7 @@ public sealed partial class PartitionProcessor
         if (count == 0)
         {
             LogAllKnown(_log, _partition, knownByHint, lastOffset);
-            _observer.OnBatchCommitted(_partition, 0, knownByHint, 0, 0, 0);
+            NotifyBatch(0, knownByHint, 0, 0, 0);
         }
         else
         {
@@ -176,13 +187,26 @@ public sealed partial class PartitionProcessor
 
             var duplicates = knownByHint + result.Duplicates;
             LogBatchCommitted(_log, _partition, count, result.Inserted, duplicates, lastOffset);
-            _observer.OnBatchCommitted(_partition, result.Inserted, duplicates, result.OutOfOrder, result.GpsJumps, result.Alerts.Count);
+            NotifyBatch(result.Inserted, duplicates, result.OutOfOrder, result.GpsJumps, result.Alerts.Count);
 
             // D1: keys only for committed events. Every event of the batch is in the DB now (new or duplicate).
             await MarkKnownAsync(buffer, count, ct).ConfigureAwait(false);
         }
 
         _offsets.Store(_partition, lastOffset + 1);
+    }
+
+    /// <summary>The batch is already committed: an observer failure is logged and must not stop the offset from being stored.</summary>
+    private void NotifyBatch(int inserted, int duplicates, int outOfOrder, int gpsJumps, int alerts)
+    {
+        try
+        {
+            _observer.OnBatchCommitted(_partition, inserted, duplicates, outOfOrder, gpsJumps, alerts);
+        }
+        catch (Exception ex)
+        {
+            LogObserverFailed(_log, ex, _partition);
+        }
     }
 
     /// <summary>Removes events the hint already knows as committed; keeps batch order. Hint failures are ignored (the DB key decides).</summary>
@@ -262,6 +286,9 @@ public sealed partial class PartitionProcessor
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Partition {Partition}: dedupe hint failed; falling back to the DB key")]
     private static partial void LogHintFailed(ILogger log, Exception ex, int partition);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Partition {Partition}: processing observer failed; processing continues")]
+    private static partial void LogObserverFailed(ILogger log, Exception ex, int partition);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Partition {Partition}: processor aborted; the unstored batch will be replayed")]
     private static partial void LogAborted(ILogger log, int partition);

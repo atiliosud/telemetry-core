@@ -317,10 +317,52 @@ public sealed class PartitionProcessorTests
         _offsets.Stored.Should().BeEmpty();
     }
 
-    private Task StartProcessor(CancellationToken ct, IDedupeHint? hint = null)
+    [Fact]
+    public async Task ThrowingObserver_ProcessorKeepsGoing_OffsetsStored_DlqPublishedOnce()
+    {
+        using var cts = new CancellationTokenSource();
+        var observer = new ThrowingObserver();
+        var run = StartProcessor(cts.Token, observer: observer);
+
+        await WriteValidAsync(2);
+        await WriteAsync(Encoding.UTF8.GetBytes("not json"));
+        await WriteValidAsync(1);
+        await WaitUntilAsync(() => _channel.Reader.Count == 0); // all four taken, so they share one batch
+        await Task.Delay(50);
+        await WaitUntilAsync(() => _offsets.Stored.Count == 1, () => _clock.Advance(TimeSpan.FromMilliseconds(100)));
+
+        await WriteValidAsync(3); // a second batch proves the processor survived the throwing observer
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        run.IsCompletedSuccessfully.Should().BeTrue();
+        _dlq.Published.Should().ContainSingle("an observer failure must not republish the DLQ message");
+        _committer.Calls.Should().HaveCount(2);
+        _offsets.Stored.Should().Equal((Partition, 4L), (Partition, 7L));
+        observer.BatchCalls.Should().Be(2);
+        observer.DlqCalls.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task ObserverDlq_CalledOnlyAfterSuccessfulPublish()
+    {
+        _dlq.FailuresBeforeSuccess = 2;
+        using var cts = new CancellationTokenSource();
+        var run = StartProcessor(cts.Token);
+
+        await WriteAsync(Encoding.UTF8.GetBytes("not json"));
+        _channel.Writer.Complete();
+        await WaitUntilAsync(() => run.IsCompleted, () => _clock.Advance(TimeSpan.FromMilliseconds(250)));
+
+        _dlq.Attempts.Should().Be(3);
+        _observer.DlqReasons.Should().Equal(DlqReasons.InvalidJson);
+        _offsets.Stored.Should().Equal((Partition, 1L));
+    }
+
+    private Task StartProcessor(CancellationToken ct, IDedupeHint? hint = null, IProcessingObserver? observer = null)
     {
         var processor = new PartitionProcessor(Partition, _channel.Reader, _committer, hint ?? new NoopDedupeHint(), _dlq, _offsets,
-            _observer, _clock, _options, NullLogger.Instance);
+            observer ?? _observer, _clock, _options, NullLogger.Instance);
         return Task.Run(() => processor.RunAsync(ct));
     }
 
@@ -428,10 +470,21 @@ public sealed class PartitionProcessorTests
 
         public List<(PartitionMessage Msg, string Reason)> Published { get; } = new();
 
+        public int FailuresBeforeSuccess { get; set; }
+
+        public int Attempts { get; private set; }
+
         public Task PublishAsync(PartitionMessage msg, string reason, CancellationToken ct)
         {
             lock (_log)
             {
+                Attempts++;
+                if (FailuresBeforeSuccess > 0)
+                {
+                    FailuresBeforeSuccess--;
+                    throw new InvalidOperationException("simulated broker failure");
+                }
+
                 Published.Add((msg, reason));
                 _log.Add("dlq:" + msg.Offset);
             }
@@ -542,6 +595,30 @@ public sealed class PartitionProcessorTests
 
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingObserver : IProcessingObserver
+    {
+        private int _batchCalls;
+        private int _dlqCalls;
+
+        public int BatchCalls => Volatile.Read(ref _batchCalls);
+
+        public int DlqCalls => Volatile.Read(ref _dlqCalls);
+
+        public void OnBatchCommitted(int partition, int inserted, int duplicates, int outOfOrder, int gpsJumps, int alerts)
+        {
+            Interlocked.Increment(ref _batchCalls);
+            throw new InvalidOperationException("observer failure");
+        }
+
+        public void OnDlq(string reason)
+        {
+            Interlocked.Increment(ref _dlqCalls);
+            throw new InvalidOperationException("observer failure");
+        }
+
+        public void OnRedisFallback() => throw new InvalidOperationException("observer failure");
     }
 
     private sealed class RecordingObserver : IProcessingObserver

@@ -8,4 +8,13 @@ if [ ! -f "$ROOT/.env" ]; then
   cp "$ROOT/.env.example" "$ROOT/.env"
   echo "Created .env from .env.example (change the placeholder values for anything beyond local demo)."
 fi
-docker compose --env-file "$ROOT/.env" -f "$ROOT/deploy/docker-compose.yml" up -d --build --wait
+COMPOSE="$ROOT/deploy/docker-compose.yml"
+# Starts Kafka, Redis, Postgres and the worker; --wait returns once every service is healthy (worker: /health/live).
+docker compose --env-file "$ROOT/.env" -f "$COMPOSE" up -d --build --wait
+# The load generator is a one-shot tool (profile "tools"): build it now so the demo starts right away.
+docker compose --env-file "$ROOT/.env" -f "$COMPOSE" --profile tools build generator
+echo
+echo "Stack is up."
+echo "  Worker metrics : http://localhost:8081/metrics"
+echo "  Worker health  : http://localhost:8081/health/live | /health/ready"
+echo "  Demo           : scripts/demo.sh --total 100000"

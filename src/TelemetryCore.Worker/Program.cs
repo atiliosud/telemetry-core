@@ -1,7 +1,10 @@
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Npgsql;
+using OpenTelemetry.Metrics;
 using TelemetryCore.Worker.Dedupe;
 using TelemetryCore.Worker.Dlq;
+using TelemetryCore.Worker.Health;
 using TelemetryCore.Worker.Ingestion;
 using TelemetryCore.Worker.Observability;
 using TelemetryCore.Worker.Persistence;
@@ -11,10 +14,19 @@ namespace TelemetryCore.Worker;
 
 public static class Program
 {
-    public static Task Main(string[] args) => BuildApp(args).RunAsync();
+    public static async Task<int> Main(string[] args)
+    {
+        if (args.Length > 0 && args[0] == HealthProbe.Argument)
+        {
+            return await HealthProbe.RunAsync().ConfigureAwait(false);
+        }
+
+        await BuildApp(args).RunAsync().ConfigureAwait(false);
+        return 0;
+    }
 
     /// <summary>
-    /// Builds the worker host (D12): the ingestion background service plus health endpoints.
+    /// Builds the worker host (D12): the ingestion background service plus /metrics, /health/live and /health/ready.
     /// </summary>
     /// <param name="args">Command-line arguments.</param>
     /// <param name="overrides">Applied after the default registrations, so tests can replace services.</param>
@@ -40,18 +52,29 @@ public static class Program
         services.AddSingleton(sp => NpgsqlDataSource.Create(sp.GetRequiredService<WorkerOptions>().PostgresConnectionString));
         services.AddSingleton<TelemetryRepository>();
         services.AddSingleton<VehicleStateCache>();
-        services.AddSingleton<IBatchCommitter, BatchCommitter>();
-        services.AddSingleton<IProcessingObserver, NoopProcessingObserver>();
+        services.AddSingleton<CircuitStateTracker>();
+        services.AddSingleton<IngestionStatus>();
+        services.AddSingleton<BatchCommitter>();
+        services.AddSingleton<IBatchCommitter>(sp => new ResilientBatchCommitter(sp.GetRequiredService<BatchCommitter>(),
+            ResiliencePipelines.CreateDatabase(sp.GetRequiredService<CircuitStateTracker>(),
+                sp.GetRequiredService<ILoggerFactory>().CreateLogger("TelemetryCore.Worker.Resilience.Database"),
+                sp.GetRequiredService<TimeProvider>())));
+        services.AddSingleton<TelemetryMetrics>();
+        services.AddSingleton<IProcessingObserver>(sp => sp.GetRequiredService<TelemetryMetrics>());
         services.AddSingleton<IDedupeHint>(CreateDedupeHint);
         services.AddSingleton<IDlqPublisher, KafkaDlqPublisher>();
         services.AddHostedService<IngestionService>();
-        services.AddHealthChecks();
+        services.AddHealthChecks().AddCheck<ReadinessCheck>("readiness", tags: new[] { ReadinessCheck.Tag });
+        services.AddOpenTelemetry().WithMetrics(metrics => metrics
+            .AddMeter(TelemetryMetrics.MeterName)
+            .AddPrometheusExporter());
 
         overrides?.Invoke(services);
 
         var app = builder.Build();
-        app.MapHealthChecks("/health/live");
-        app.MapHealthChecks("/health/ready"); // stub: real dependency checks come with the readiness task
+        app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
+        app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = check => check.Tags.Contains(ReadinessCheck.Tag) });
+        app.MapPrometheusScrapingEndpoint(); // /metrics
         return app;
     }
 
@@ -66,6 +89,17 @@ public static class Program
 
         var observer = sp.GetRequiredService<IProcessingObserver>();
         return RedisDedupeHint.Connect(connectionString, ResiliencePipelines.CreateRedis(sp.GetRequiredService<TimeProvider>()),
-            observer.OnRedisFallback, sp.GetRequiredService<ILoggerFactory>().CreateLogger<RedisDedupeHint>());
+            () =>
+            {
+                try
+                {
+                    observer.OnRedisFallback();
+                }
+                catch (Exception)
+                {
+                    // Metrics must never change the fallback path.
+                }
+            },
+            sp.GetRequiredService<ILoggerFactory>().CreateLogger<RedisDedupeHint>());
     }
 }

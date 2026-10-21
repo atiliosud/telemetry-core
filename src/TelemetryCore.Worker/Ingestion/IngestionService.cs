@@ -29,6 +29,7 @@ public sealed partial class IngestionService : BackgroundService
     private readonly IDlqPublisher _dlq;
     private readonly IProcessingObserver _observer;
     private readonly VehicleStateCache _cache;
+    private readonly IngestionStatus _status;
     private readonly TimeProvider _clock;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<IngestionService> _log;
@@ -38,7 +39,7 @@ public sealed partial class IngestionService : BackgroundService
     private IOffsetSink? _offsetSink;
 
     public IngestionService(IOptions<WorkerOptions> options, IBatchCommitter committer, IDedupeHint dedupe, IDlqPublisher dlq,
-        IProcessingObserver observer, VehicleStateCache cache, TimeProvider clock, ILoggerFactory loggerFactory)
+        IProcessingObserver observer, VehicleStateCache cache, IngestionStatus status, TimeProvider clock, ILoggerFactory loggerFactory)
     {
         _options = options.Value;
         _committer = committer;
@@ -46,6 +47,7 @@ public sealed partial class IngestionService : BackgroundService
         _dlq = dlq;
         _observer = observer;
         _cache = cache;
+        _status = status;
         _clock = clock;
         _loggerFactory = loggerFactory;
         _log = loggerFactory.CreateLogger<IngestionService>();
@@ -57,10 +59,28 @@ public sealed partial class IngestionService : BackgroundService
 
     private async Task RunAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await ConsumeLoopAsync(stoppingToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            LogLoopCrashed(_log, ex); // readiness turns red
+            throw;
+        }
+        finally
+        {
+            _status.SetRunning(false);
+        }
+    }
+
+    private async Task ConsumeLoopAsync(CancellationToken stoppingToken)
+    {
         using var consumer = BuildConsumer();
         _offsetSink = new ConsumerOffsetSink(consumer, _options.Topic, _loggerFactory.CreateLogger<ConsumerOffsetSink>());
         consumer.Subscribe(_options.Topic);
         LogStarted(_log, _options.Topic, _options.GroupId);
+        _status.SetRunning(true);
 
         try
         {
@@ -81,6 +101,15 @@ public sealed partial class IngestionService : BackgroundService
                 if (result is null || result.IsPartitionEOF)
                 {
                     continue;
+                }
+
+                try
+                {
+                    _observer.OnConsumed();
+                }
+                catch (Exception ex)
+                {
+                    LogObserverFailed(_log, ex);
                 }
 
                 if (!_workers.TryGetValue(result.Partition.Value, out var worker))
@@ -304,6 +333,12 @@ public sealed partial class IngestionService : BackgroundService
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Kafka error {Code}: {Reason} (fatal: {IsFatal})")]
     private static partial void LogKafkaError(ILogger log, ErrorCode code, string reason, bool isFatal);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Processing observer failed in the consume loop; consuming continues")]
+    private static partial void LogObserverFailed(ILogger log, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Critical, Message = "Consume loop crashed")]
+    private static partial void LogLoopCrashed(ILogger log, Exception ex);
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Ingestion stopped; offsets committed and consumer closed")]
     private static partial void LogStopped(ILogger log);

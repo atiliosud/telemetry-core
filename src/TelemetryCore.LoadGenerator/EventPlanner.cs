@@ -63,7 +63,7 @@ public sealed class EventPlanner
         var swapStart = new HashSet<long>();
         for (var i = 0; i < nSwap; i++) swapStart.Add(pairs[i] * 2L);
 
-        var fleet = new FleetSimulator(_o.Vehicles, (int)_speedingVehicles, rng);
+        var fleet = new FleetSimulator(_o.Vehicles, (int)_speedingVehicles, rng, _o.VehiclePrefix);
         var ring = new PlannedMessage[RingSize];
         var ringCount = 0;
         long ringNext = 0;

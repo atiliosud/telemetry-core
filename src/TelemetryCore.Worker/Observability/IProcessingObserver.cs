@@ -3,7 +3,8 @@ namespace TelemetryCore.Worker.Observability;
 /// <summary>
 /// Processing events the metrics layer needs (<c>telemetry_events_processed_total</c>, <c>telemetry_duplicates_total</c>,
 /// <c>telemetry_dlq_total</c>, <c>telemetry_redis_fallback_total</c>, ...). Called from partition processors, so
-/// implementations must be thread-safe and cheap. Registered as <see cref="NoopProcessingObserver"/> until metrics exist.
+/// implementations must be thread-safe and cheap. Callers guard every call: an observer exception is logged, never
+/// allowed to change processing. The worker registers <see cref="TelemetryMetrics"/>.
 /// </summary>
 public interface IProcessingObserver
 {
@@ -18,4 +19,9 @@ public interface IProcessingObserver
 
     /// <summary>A Redis hint call failed or timed out; the DB key alone decided.</summary>
     void OnRedisFallback();
+
+    /// <summary>The consume loop read one Kafka record (<c>telemetry_events_consumed_total</c>).</summary>
+    void OnConsumed()
+    {
+    }
 }

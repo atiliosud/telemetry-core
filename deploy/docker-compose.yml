@@ -1,8 +1,10 @@
 name: telemetry-core
 
-# Local infrastructure. Run through scripts/up.ps1 | scripts/up.sh so .env is loaded:
+# Local stack. Run through scripts/up.ps1 | scripts/up.sh so .env is loaded:
 #   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build --wait
-# Later services (worker, read-api, load generator, observability) are added to this file.
+# The load generator is a one-shot tool (profile "tools"), started by scripts/demo.ps1 | scripts/demo.sh:
+#   docker compose --env-file .env -f deploy/docker-compose.yml run --rm generator --total 100000
+# Later services (read-api, observability) are added to this file.
 
 services:
   kafka:
@@ -79,6 +81,58 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
+  worker:
+    build:
+      context: ..
+      dockerfile: src/TelemetryCore.Worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      Worker__BootstrapServers: kafka:9092
+      Worker__PostgresConnectionString: Host=postgres;Database=telemetry;Username=telemetry_worker;Password=${TELEMETRY_WORKER_DB_PASSWORD:?set TELEMETRY_WORKER_DB_PASSWORD in .env};Maximum Pool Size=30;GSS Encryption Mode=Disable
+      Worker__RedisConnectionString: redis:6379
+      DOTNET_gcServer: "1"
+    ports:
+      - "127.0.0.1:8081:8080"
+    # SIGTERM → stop consuming, drain, flush, commit offsets (target < 20 s; host ShutdownTimeout 25 s).
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "dotnet", "/app/TelemetryCore.Worker.dll", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  generator:
+    build:
+      context: ..
+      dockerfile: src/TelemetryCore.LoadGenerator/Dockerfile
+    profiles: ["tools"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # Extra arguments of "docker compose run --rm generator ..." are appended (later flags win).
+    entrypoint: ["dotnet", "TelemetryCore.LoadGenerator.dll", "--bootstrap", "kafka:9092"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   pgdata:

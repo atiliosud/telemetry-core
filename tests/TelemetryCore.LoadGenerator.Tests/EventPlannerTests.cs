@@ -27,6 +27,15 @@ public class EventPlannerTests
         JsonSerializer.Deserialize(m.Payload, TelemetryJsonContext.Default.TelemetryEventDto)!;
 
     [Fact]
+    public void Plan_UsesVehiclePrefix_ForKeysAndIds()
+    {
+        var o = GeneratorOptions.Parse(new[] { "--total", "500", "--vehicles", "10", "--vehicle-prefix", "RUN7-" });
+        var (msgs, _) = Run(o);
+        msgs.Should().OnlyContain(m => m.Key.StartsWith("RUN7-"));
+        msgs.Where(m => m.Kind != MessageKind.Invalid).Select(Decode).Should().OnlyContain(e => e.VehicleId!.StartsWith("RUN7-"));
+    }
+
+    [Fact]
     public void Plan_EmitsExactlyTotal()
     {
         var (msgs, p) = Run(Opts());

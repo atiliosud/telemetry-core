@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using WorkerProgram = TelemetryCore.Worker.Program;
@@ -36,6 +38,16 @@ public sealed class WorkerHarness : IAsyncDisposable
     }
 
     public IServiceProvider Services => _app.Services;
+
+    /// <summary>Actual HTTP address of the started host (the harness binds port 0).</summary>
+    public Uri BaseAddress
+    {
+        get
+        {
+            var addresses = _app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses;
+            return new Uri(addresses.First());
+        }
+    }
 
     public async Task StartAsync()
     {

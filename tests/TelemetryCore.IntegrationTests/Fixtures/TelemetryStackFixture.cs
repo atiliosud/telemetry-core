@@ -149,6 +149,19 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
         }
     }
 
+    /// <summary>Produces many events concurrently (in flight together), for load-style tests.</summary>
+    public async Task ProduceManyAsync(IEnumerable<TelemetryEventDto> events, string topic)
+    {
+        var pending = new List<Task>();
+        foreach (var dto in events)
+        {
+            var payload = JsonSerializer.SerializeToUtf8Bytes(dto, TelemetryJsonContext.Default.TelemetryEventDto);
+            pending.Add(_producer!.ProduceAsync(topic, new Message<string?, byte[]?> { Key = dto.VehicleId, Value = payload }));
+        }
+
+        await Task.WhenAll(pending);
+    }
+
     public async Task ProduceRawAsync(string? key, byte[]? value, string topic = Topics.Raw)
     {
         await _producer!.ProduceAsync(topic, new Message<string?, byte[]?> { Key = key, Value = value });

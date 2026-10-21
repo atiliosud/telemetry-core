@@ -1,0 +1,16 @@
+# Keep build contexts small: only sources and build props are needed.
+**/bin/
+**/obj/
+.git/
+.vs/
+.vscode/
+.idea/
+.superpowers/
+artifacts/
+TestResults/
+tests/
+docs/
+deploy/
+scripts/
+*.md
+.env
