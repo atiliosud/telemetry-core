@@ -49,4 +49,36 @@ public sealed class VehicleStateCacheTests
 
         cache.Count.Should().Be(0);
     }
+
+    [Fact]
+    public void Publish_FromEarlierOwnership_AfterRevokeAndReassign_IsDropped()
+    {
+        // A processor cancelled after a drain timeout is still in COMMIT; its batch captured the generation before.
+        var cache = new VehicleStateCache();
+        var staleGeneration = cache.Generation(3);
+        cache.EvictPartition(3); // revoked
+        cache.EvictPartition(3); // assigned back to this pod
+        var stale = VehicleState.New("VH-1", 3);
+        stale.LastSeq = 40;
+
+        cache.Publish(new[] { stale }, 3, staleGeneration).Should().BeFalse();
+
+        cache.TryGet("VH-1", out _).Should().BeFalse("the new owner must reload VH-1 from vehicle_state, not use the zombie's copy");
+    }
+
+    [Fact]
+    public void Publish_CurrentOwnership_IsPublished_AndOtherPartitionsAreIndependent()
+    {
+        var cache = new VehicleStateCache();
+        cache.EvictPartition(3);
+        var generation = cache.Generation(3);
+        var otherGeneration = cache.Generation(4);
+        cache.EvictPartition(5); // another partition's rebalance does not affect partitions 3 and 4
+
+        cache.Publish(new[] { VehicleState.New("VH-1", 3) }, 3, generation).Should().BeTrue();
+        cache.Publish(new[] { VehicleState.New("VH-2", 4) }, 4, otherGeneration).Should().BeTrue();
+
+        cache.TryGet("VH-1", out _).Should().BeTrue();
+        cache.TryGet("VH-2", out _).Should().BeTrue();
+    }
 }

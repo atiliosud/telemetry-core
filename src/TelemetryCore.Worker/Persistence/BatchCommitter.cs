@@ -59,6 +59,8 @@ public sealed class BatchCommitter : IBatchCommitter
 
     private async Task<PersistResult> CommitCoreAsync(ReadOnlyMemory<TelemetryEvent> events, int partition, CancellationToken ct)
     {
+        // Captured before any state is read: if the partition is revoked/reassigned meanwhile, the publish below is skipped.
+        var generation = _cache.Generation(partition);
         await using var conn = await _dataSource.OpenConnectionAsync(ct).ConfigureAwait(false);
         await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
 
@@ -99,7 +101,7 @@ public sealed class BatchCommitter : IBatchCommitter
             // (committed on the server, error on the client) and the retry would count the whole batch as duplicates.
             // COMMIT is still bounded by the Npgsql command timeout.
             await CommitTransactionAsync(tx, CancellationToken.None).ConfigureAwait(false);
-            _cache.Publish(touched.Values);
+            _cache.Publish(touched.Values, partition, generation);
         }
         else
         {
