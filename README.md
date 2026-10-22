@@ -96,7 +96,7 @@ Details in [docs/TESTING.md](docs/TESTING.md).
 
 ## Measured results
 
-Local laptop measurements, single-node Kafka, one worker replica. Not a benchmark. Raw outputs are written under `artifacts/` by the scripts.
+Local laptop measurements, single-node Kafka, one worker replica. Not a benchmark. Raw outputs are written under `artifacts/` by the scripts. Chaos runs: 100,000 events at 2,000 events/s, from a fresh clone and an empty database.
 
 | Metric | Value |
 |---|---|
@@ -108,8 +108,10 @@ Local laptop measurements, single-node Kafka, one worker replica. Not a benchmar
 | Duplicates detected vs injected | 2,000 / 2,000 (100k); 20,000 / 20,000 (1M) |
 | Out-of-order detected vs injected | 1,000 / 1,000 (100k); 10,000 / 10,000 (1M) |
 | DLQ messages vs invalid injected | 500 / 500 (100k); 5,000 / 5,000 (1M, 1,000 per reason) |
-| Recovery after worker kill (`docker kill -s KILL`, 100k) | PASS: 97,500 / 97,500 unique rows, none lost or duplicated; lag 49,751 while down, 0 about 55 s after the restart |
-| Recovery after DB outage (PostgreSQL stopped 20 s, 100k) | PASS: 97,500 / 97,500 unique rows; lag held at 59,901 during the outage (backpressure, nothing dropped) and reached 0 about 27 s after PostgreSQL started. The breaker gauge sampled by Prometheus stayed at 0 (closed), so circuit opening was not observed in this run |
+| Recovery after worker kill (`docker kill -s KILL`, 100k) | PASS: 97,500 / 97,500 unique rows after `docker kill -s KILL` mid-load and restart; none lost or duplicated |
+| Recovery after DB outage (PostgreSQL stopped 20 s, 100k) | PASS: 97,500 / 97,500 unique rows; 90 failed DB writes during the 20 s outage, all retried and recovered (backpressure, nothing dropped). With the spec thresholds (50 % in 30 s) a 20 s outage left the breaker closed; `PostgresPaused20s_BreakerOpens_NoDataLost` shows it opening |
+| Redis down (chaos, 100k) | PASS: 97,500 / 97,500 unique rows with Redis down until every row was persisted; ~6,450 Redis fallbacks to the DB key |
+| Rebalance 1 → 2 → 1 workers (chaos, 100k) | PASS: 97,500 / 97,500 unique rows while scaling to 2 workers and back to 1 (partitions revoked/assigned, no loss, no double count) |
 
 ## Design decisions
 
