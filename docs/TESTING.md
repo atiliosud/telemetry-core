@@ -37,11 +37,11 @@ Requires the stack to be up (`scripts\up.ps1`).
 ```powershell
 scripts\chaos.ps1 -Scenario kill        # docker kill -s KILL the worker 15 s into the load, then start it again
 scripts\chaos.ps1 -Scenario postgres    # stop PostgreSQL for 20 s during the load
-scripts\chaos.ps1 -Scenario redis       # stop Redis for the rest of the run (the worker falls back to the DB key)
+scripts\chaos.ps1 -Scenario redis       # stop Redis until every row is persisted (the worker falls back to the DB key)
 scripts\chaos.ps1 -Scenario rebalance   # scale the worker to 2 replicas and back to 1 during the load
 ```
 
-Each scenario runs the load generator (fresh random seed and vehicle prefix), injects the failure, waits, and passes only if the number of new **unique rows** in `processed_events` equals the expected unique events. Crash replays are counted as duplicates by the worker, so counters are not compared in chaos runs (D1). Breaker state and consumer lag are printed before, during and after. Output is saved under `artifacts/chaos-*.txt`. Linux/macOS: `./scripts/chaos.sh kill`.
+Each scenario runs the load generator (100,000 events at 2,000 events/s by default, `-Total` and `-Rate` to change; fresh random seed and vehicle prefix), injects the failure while the load is flowing, waits, and passes only if the number of new **unique rows** in `processed_events` equals the expected unique events. Extra checks: `postgres` requires the circuit breaker to open (gauge max = 1), `redis` requires Redis fallbacks > 0, `rebalance` requires two worker containers running (D31). `-Scenario all` runs the four in sequence. Crash replays are counted as duplicates by the worker, so counters are not compared in chaos runs (D1). Breaker state and consumer lag are printed before, during and after. Output is saved under `artifacts/chaos-*.txt`. Linux/macOS: `./scripts/chaos.sh kill` (or `all`).
 
 Container-level resilience tests live in `ResilienceTests` (integration project): in-process crash mid-batch, Redis down, PostgreSQL paused and a two-worker rebalance.
 

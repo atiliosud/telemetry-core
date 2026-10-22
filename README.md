@@ -135,7 +135,6 @@ All in [docs/DECISIONS.md](docs/DECISIONS.md). Highlights:
 - Poison outbox rows are retried forever (no outbox DLQ or attempt limit).
 - Kubernetes manifests were validated offline but not run on a cluster.
 - Only the `SPEEDING` alert is implemented.
-- The Compose worker publishes a fixed host port (8081), so `--scale worker=2` fails; rebalance is tested in-process (`ResilienceTests`) and in Kubernetes via KEDA replicas.
 - Latency under backlog: one worker persists ~6.9k events/s; when producers are faster, p95 latency reflects time queued in Kafka (30 s histogram ceiling in the 1M run).
 
 ## Repository structure

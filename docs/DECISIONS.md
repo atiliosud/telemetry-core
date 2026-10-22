@@ -103,3 +103,9 @@ A moving tag can change broker behavior between runs; the pinned version keeps t
 
 ### D29. Vehicle id format and Kafka key are validated before the batch
 `vehicleId` must match `^[A-Za-z0-9_-]{1,64}$` (shared with the Read API in `Contracts/VehicleIds`), otherwise the message goes to the DLQ as `invalid_vehicle_id`. A NUL byte or other free text would be rejected by PostgreSQL, the batch would be retried forever (D11) and the partition would stall. When the Kafka key is present and differs from the payload `vehicleId`, the message goes to the DLQ as `key_mismatch`, because the key decides the partition and one vehicle must not be split over two partitions. A missing key is accepted. `eventId` is a GUID and the other fields are numbers, so `vehicleId` is the only free-form text field.
+
+### D30. Cache ownership generation per partition
+`EvictPartition` bumps a generation number for the partition. A batch captures the generation before it starts and publishes its vehicle states to the cache only if the generation is unchanged. A processor that was cancelled after a slow revoke drain but still finished its `COMMIT` can no longer put stale state into a cache that was just cleared (the `last_seq` guard already protects the database row).
+
+### D31. Chaos scripts throttle the load and check the fault really happened
+The generator runs at 2,000 events/s during chaos runs so the load is still flowing while the fault is active. Besides the unique-row count, the PostgreSQL scenario requires the breaker gauge to reach 1 (open), the Redis scenario requires Redis fallbacks > 0 (Redis stays down until all rows are persisted), and the rebalance scenario requires two worker containers running. The Compose worker publishes the host port range 8081-8082 so a second replica can start.
