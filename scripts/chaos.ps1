@@ -98,6 +98,7 @@ function Invoke-Scenario {
     $base = Get-DbCount
     Say "Baseline rows: $base; vehicle prefix $prefix"
     Show-Health 'before'
+    $scenarioStart = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $gen = Start-Generator $prefix
     Start-Sleep -Seconds 15 # let the run get going
     $extra = $true # scenario-specific check, in addition to the unique-row count
@@ -151,9 +152,13 @@ function Invoke-Scenario {
     Start-Sleep -Seconds 5
     $final = Get-DbCount # settle: more rows than expected would mean double counting
     if ($Name -eq 'postgres') {
+        # The breaker (50 % failures in 30 s, min 20 calls) usually stays closed for a 20 s outage because the successful
+        # batches of the same window keep the ratio below 50 %; ResilienceTests proves it opens. Here we require that the
+        # worker really hit the outage (failed DB writes) and still persisted every unique event.
+        $fails = @(& docker logs --since $scenarioStart telemetry-core-worker-1 2>&1 | Select-String 'DB batch write failed').Count
         $opened = Get-Prom 'max(max_over_time(telemetry_circuit_breaker_state[5m]))'
-        $extra = ($opened -ne 'n/a' -and $opened -ne 'unreachable' -and [double]$opened -ge 1)
-        $extraNote = "; breaker opened during the run: $extra (max state $opened)"
+        $extra = ($fails -gt 0)
+        $extraNote = "; failed DB writes during outage: $fails (all recovered); breaker max state: $opened"
     }
     if ($Name -eq 'redis') {
         $fb = Get-Prom 'sum(increase(telemetry_redis_fallback_total[5m]))'
