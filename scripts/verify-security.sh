@@ -29,8 +29,8 @@ for pair in worker:telemetry-core-worker read-api:telemetry-core-read-api genera
     hc="$(docker inspect "$cid" --format '{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|{{json .HostConfig.SecurityOpt}}')"
     IFS='|' read -r ro cd so <<<"$hc"
     check "$svc: read-only root filesystem" "$(b [ "$ro" = true ])" "$hc"
-    check "$svc: cap_drop ALL" "$(b [[ "$cd" == *ALL* ]])" "$hc"
-    check "$svc: no-new-privileges" "$(b [[ "$so" == *no-new-privileges* ]])" "$hc"
+    check "$svc: cap_drop ALL" "$(b grep -q ALL <<<"$cd")" "$hc"
+    check "$svc: no-new-privileges" "$(b grep -q no-new-privileges <<<"$so")" "$hc"
   else
     cfg="$(docker compose --env-file "$envfile" -f "$compose" --profile tools config 2>/dev/null | awk -v s="  $svc:" '$0==s{f=1;next} f&&/^  [a-z]/{f=0} f')"
     check "$svc: read-only root filesystem (config)" "$(b grep -q 'read_only: true' <<<"$cfg")" "read_only not set"
