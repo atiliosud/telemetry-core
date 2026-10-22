@@ -106,6 +106,9 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
         _producer = new ProducerBuilder<string?, byte[]?>(new ProducerConfig
         {
             BootstrapServers = BootstrapServers,
+            // Idempotent: ProduceManyAsync keeps thousands of messages in flight. Without it librdkafka may retry a failed
+            // request (e.g. no leader yet on a just-created topic) after a later one succeeded, reordering seqs in a partition.
+            EnableIdempotence = true,
             Acks = Acks.All,
             LingerMs = 5,
         }).Build();
@@ -160,6 +163,55 @@ public sealed class TelemetryStackFixture : IAsyncLifetime
         }
 
         await Task.WhenAll(pending);
+    }
+
+    /// <summary>Reads the whole topic and counts messages whose seq is not above the last seq seen for their vehicle in
+    /// the same partition (exact re-sends of an event id excluded): the out-of-order events the log itself contains.</summary>
+    public long CountSeqInversionsInTopic(string topic, int partitions)
+    {
+        using var consumer = new ConsumerBuilder<Ignore, byte[]>(new ConsumerConfig
+        {
+            BootstrapServers = BootstrapServers,
+            GroupId = UniqueName("inversions"),
+            EnableAutoCommit = false,
+        }).Build();
+        long inversions = 0;
+        for (var p = 0; p < partitions; p++)
+        {
+            var tp = new TopicPartition(topic, p);
+            var high = consumer.QueryWatermarkOffsets(tp, TimeSpan.FromSeconds(10)).High.Value;
+            if (high == 0)
+            {
+                continue;
+            }
+
+            consumer.Assign(new TopicPartitionOffset(tp, Offset.Beginning));
+            var lastSeq = new Dictionary<string, long>(StringComparer.Ordinal);
+            var seen = new HashSet<Guid>();
+            while (true)
+            {
+                var r = consumer.Consume(TimeSpan.FromSeconds(10)) ?? throw new TimeoutException($"partition {p} not read to its end");
+                var dto = JsonSerializer.Deserialize(r.Message.Value, TelemetryJsonContext.Default.TelemetryEventDto)!;
+                if (seen.Add(dto.EventId!.Value))
+                {
+                    if (lastSeq.TryGetValue(dto.VehicleId!, out var last) && dto.Seq!.Value <= last)
+                    {
+                        inversions++;
+                    }
+                    else
+                    {
+                        lastSeq[dto.VehicleId!] = dto.Seq!.Value;
+                    }
+                }
+
+                if (r.Offset.Value >= high - 1)
+                {
+                    break;
+                }
+            }
+        }
+
+        return inversions;
     }
 
     public async Task ProduceRawAsync(string? key, byte[]? value, string topic = Topics.Raw)

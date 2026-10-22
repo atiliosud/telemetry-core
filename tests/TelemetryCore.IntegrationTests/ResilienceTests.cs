@@ -52,6 +52,7 @@ public sealed class ResilienceTests
         }
 
         _output.WriteLine($"Crashed on partition {injector.CrashedPartition}; rows at crash {rowsAtCrash} of {load.Unique}");
+        _stack.CountSeqInversionsInTopic(topic, 12).Should().Be(0, "the producer must keep per-vehicle order in the log");
         rowsAtCrash.Should().BeLessThan(load.Unique, "the worker crashed mid-run");
 
         var observer = new CountingObserver();
@@ -232,9 +233,8 @@ public sealed class ResilienceTests
                 "SELECT count(*) FROM vehicle_state s WHERE s.vehicle_id LIKE @p || '%' AND s.last_seq = " +
                 "(SELECT max(e.seq) FROM processed_events e WHERE e.vehicle_id = s.vehicle_id)", prefix))
             .Should().Be(load.Vehicles, "last_seq of every vehicle equals its max seq");
-        // Recorded, not asserted: see task-10a-report (out_of_order rows seen when duplicates reach the DB without the Redis hint).
-        _output.WriteLine("out_of_order rows: " +
-            await ScalarAsync("SELECT count(*) FROM processed_events WHERE vehicle_id LIKE @p || '%' AND out_of_order", prefix));
+        (await ScalarAsync("SELECT count(*) FROM processed_events WHERE vehicle_id LIKE @p || '%' AND out_of_order", prefix))
+            .Should().Be(0, "the load is in order per vehicle (idempotent producer), so no event may be flagged out-of-order");
         (await ScalarAsync("SELECT count(*) - count(DISTINCT (vehicle_id, seq)) FROM processed_events WHERE vehicle_id LIKE @p || '%'", prefix))
             .Should().Be(0, "no (vehicle, seq) stored twice");
     }
