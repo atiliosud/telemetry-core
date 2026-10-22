@@ -1,5 +1,5 @@
-# Chaos scenarios against the running compose stack (SPEC section 16). Requires scripts\up.ps1 first.
-#   scripts\chaos.ps1 -Scenario kill|postgres|redis|rebalance|all [-Total 200000]
+﻿# Chaos scenarios against the running compose stack (SPEC section 16). Requires scripts\up.ps1 first.
+#   scripts\chaos.ps1 -Scenario kill|postgres|redis|rebalance|all [-Total 100000] [-Rate 2000]
 # Each scenario runs the load generator in the background (fresh --vehicle-prefix), injects the fault mid-run, then waits
 # until processed_events grows by the generator's expectedUnique (D1 counting rule: unique rows, not counters) and prints
 # PASS/FAIL. Breaker state and consumer lag are read from Prometheus before / during / after the fault.
@@ -7,8 +7,8 @@
 param(
     [ValidateSet('kill', 'postgres', 'redis', 'rebalance', 'all')]
     [string]$Scenario = 'all',
-    [long]$Total = 200000,
-    [int]$Rate = 0,
+    [long]$Total = 100000,
+    [int]$Rate = 2000, # throttled so the load is still flowing while the fault is active
     [int]$TimeoutMinutes = 10,
     [string]$PrometheusUrl = 'http://localhost:9090'
 )
@@ -100,6 +100,8 @@ function Invoke-Scenario {
     Show-Health 'before'
     $gen = Start-Generator $prefix
     Start-Sleep -Seconds 15 # let the run get going
+    $extra = $true # scenario-specific check, in addition to the unique-row count
+    $extraNote = ''
 
     switch ($Name) {
         'kill' {
@@ -124,6 +126,9 @@ function Invoke-Scenario {
         'rebalance' {
             $r = Invoke-Compose @('up', '-d', '--no-recreate', '--scale', 'worker=2', 'worker'); Say "scale worker=2 -> exit $($r.ExitCode)"
             Start-Sleep -Seconds 20
+            $running = @(& docker ps --filter 'label=com.docker.compose.project=telemetry-core' --filter 'label=com.docker.compose.service=worker' --format '{{.Names}}').Count
+            $extra = ($r.ExitCode -eq 0 -and $running -eq 2)
+            $extraNote = "; workers running during rebalance: $running"
             Show-Health 'during (2 workers)'
             $r = Invoke-Compose @('up', '-d', '--no-recreate', '--scale', 'worker=1', 'worker'); Say "scale worker=1 -> exit $($r.ExitCode)"
         }
@@ -135,7 +140,6 @@ function Invoke-Scenario {
     $lines = @(Get-Content $gen.Out -ErrorAction SilentlyContinue)
     Remove-Item $gen.Out -ErrorAction SilentlyContinue
     $summaryLine = $lines | Where-Object { $_ -like 'SUMMARY *' } | Select-Object -Last 1
-    if ($name -eq 'redis') { $r = Invoke-Compose @('start', 'redis'); Say "compose start redis -> exit $($r.ExitCode)" }
     if (-not $summaryLine) {
         Say "Generator failed (exit $genExit):"
         $lines | Select-Object -Last 15 | ForEach-Object { Say $_ }
@@ -146,11 +150,22 @@ function Invoke-Scenario {
     $final = Wait-Rows ($base + $expected)
     Start-Sleep -Seconds 5
     $final = Get-DbCount # settle: more rows than expected would mean double counting
+    if ($Name -eq 'postgres') {
+        $opened = Get-Prom 'max(max_over_time(telemetry_circuit_breaker_state[5m]))'
+        $extra = ($opened -ne 'n/a' -and $opened -ne 'unreachable' -and [double]$opened -ge 1)
+        $extraNote = "; breaker opened during the run: $extra (max state $opened)"
+    }
+    if ($Name -eq 'redis') {
+        $fb = Get-Prom 'sum(increase(telemetry_redis_fallback_total[5m]))'
+        $extra = ($fb -ne 'n/a' -and $fb -ne 'unreachable' -and [double]$fb -gt 0)
+        $extraNote = "; Redis fallbacks while down: $fb"
+        $r = Invoke-Compose @('start', 'redis'); Say "compose start redis -> exit $($r.ExitCode)"
+    }
     Show-Health 'after'
     $delta = $final - $base
-    $ok = ($delta -eq $expected)
+    $ok = ($delta -eq $expected) -and $extra
     if ($ok) { $res = 'PASS' } else { $res = 'FAIL' }
-    Say ("RESULT {0}: {1}  unique rows delta {2} / expected {3}" -f $Name, $res, $delta, $expected)
+    Say ("RESULT {0}: {1}  unique rows delta {2} / expected {3}{4}" -f $Name, $res, $delta, $expected, $extraNote)
     return $ok
 }
 
