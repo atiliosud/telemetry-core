@@ -19,3 +19,5 @@ TestResults/
 *.rsp
 *.nupkg
 .dotnet/
+CLAUDE.md
+.claude/
