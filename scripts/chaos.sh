@@ -65,7 +65,7 @@ run_scenario() {
     redis)
       dc stop redis >/dev/null 2>&1; say "compose stop redis -> exit $? (stays down for the rest of the run)"; health during ;;
     rebalance)
-      dc up -d --no-recreate --scale worker=2 worker >/dev/null 2>&1; say "scale worker=2 -> exit $?"
+      dc -f "$ROOT/deploy/docker-compose.scale.yml" up -d --no-recreate --scale worker=2 worker >/dev/null 2>&1; say "scale worker=2 -> exit $?"
       sleep 20; health "during (2 workers)"
       v="$(docker ps --filter label=com.docker.compose.project=telemetry-core --filter label=com.docker.compose.service=worker -q | wc -l | tr -d ' ')"
       [ "$v" = 2 ] || extra=0; note="; workers running during rebalance: $v"

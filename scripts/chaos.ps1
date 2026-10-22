@@ -124,7 +124,7 @@ function Invoke-Scenario {
             Show-Health 'during'
         }
         'rebalance' {
-            $r = Invoke-Compose @('up', '-d', '--no-recreate', '--scale', 'worker=2', 'worker'); Say "scale worker=2 -> exit $($r.ExitCode)"
+            $r = Invoke-Compose @('-f', (Join-Path $root 'deploy\docker-compose.scale.yml'), 'up', '-d', '--no-recreate', '--scale', 'worker=2', 'worker'); Say "scale worker=2 -> exit $($r.ExitCode)"
             Start-Sleep -Seconds 20
             $running = @(& docker ps --filter 'label=com.docker.compose.project=telemetry-core' --filter 'label=com.docker.compose.service=worker' --format '{{.Names}}').Count
             $extra = ($r.ExitCode -eq 0 -and $running -eq 2)

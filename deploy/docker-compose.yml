@@ -105,7 +105,7 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: telemetry-worker
     ports:
-      - "127.0.0.1:8081-8082:8080" # range so `--scale worker=2` can start a second replica (chaos rebalance)
+      - "127.0.0.1:8081:8080"
     # SIGTERM → stop consuming, drain, flush, commit offsets (target < 20 s; host ShutdownTimeout 25 s).
     stop_grace_period: 30s
     read_only: true

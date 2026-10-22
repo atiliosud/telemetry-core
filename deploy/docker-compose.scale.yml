@@ -1,0 +1,4 @@
+# Used by scripts/chaos (rebalance): extra worker replicas publish no host port, so they do not clash with 8081.
+services:
+  worker:
+    ports: !reset []
