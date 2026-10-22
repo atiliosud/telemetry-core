@@ -26,7 +26,7 @@ public static class Endpoints
             {
                 return Results.ValidationProblem(new Dictionary<string, string[]>
                 {
-                    ["vehicleId"] = new[] { "vehicleId must match ^[A-Za-z0-9_-]{1,64}$." },
+                    ["vehicleId"] = new[] { $"vehicleId must match {TelemetryCore.Contracts.VehicleIds.Pattern}." },
                 });
             }
 

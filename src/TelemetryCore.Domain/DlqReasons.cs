@@ -11,4 +11,6 @@ public static class DlqReasons
     public const string SpeedOutOfRange = "speed_out_of_range";
     public const string TimestampInFuture = "timestamp_in_future";
     public const string TimestampTooOld = "timestamp_too_old";
+    public const string InvalidVehicleId = "invalid_vehicle_id";
+    public const string KeyMismatch = "key_mismatch";
 }

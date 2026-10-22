@@ -51,6 +51,13 @@ public static class EventValidator
             return false;
         }
 
+        // D29: the id goes to text columns and is a query key; NUL bytes would make the batch commit fail forever.
+        if (!VehicleIds.IsValid(dto.VehicleId))
+        {
+            reason = DlqReasons.InvalidVehicleId;
+            return false;
+        }
+
         var lat = dto.Lat.Value;
         var lon = dto.Lon.Value;
         var speed = dto.SpeedKmh.Value;

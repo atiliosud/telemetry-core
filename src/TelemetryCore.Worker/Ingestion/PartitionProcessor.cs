@@ -131,7 +131,8 @@ public sealed partial class PartitionProcessor
     private async ValueTask<int> AddAsync(PartitionMessage msg, Batch batch, int count, CancellationToken ct)
     {
         _links.Add(msg.ParentContext);
-        if (EventValidator.TryParse(msg.Value, _clock.GetUtcNow(), out var evt, out var reason))
+        if (EventValidator.TryParse(msg.Value, _clock.GetUtcNow(), out var evt, out var reason)
+            && !IsKeyMismatch(msg.Key, evt.VehicleId, out reason))
         {
             batch.Events[count] = evt;
             batch.Offsets[count] = msg.Offset;
@@ -166,6 +167,19 @@ public sealed partial class PartitionProcessor
         }
 
         return count;
+    }
+
+    /// <summary>D29: the Kafka key decides the partition; a different payload vehicle id would split one vehicle over two partitions.</summary>
+    private static bool IsKeyMismatch(string? key, string vehicleId, out string? reason)
+    {
+        if (key is not null && !string.Equals(key, vehicleId, StringComparison.Ordinal))
+        {
+            reason = DlqReasons.KeyMismatch;
+            return true;
+        }
+
+        reason = null;
+        return false;
     }
 
     private async Task FlushAsync(Batch batch, int count, int messages, long lastOffset, CancellationToken ct)

@@ -407,6 +407,25 @@ public sealed class PartitionProcessorTests
         _observer.Latencies.Should().HaveCount(45).And.OnlyContain(l => l >= 2.0);
     }
 
+    [Fact]
+    public async Task KeyDifferentFromVehicleId_GoesToDlq_OffsetStillAdvances()
+    {
+        using var cts = new CancellationTokenSource();
+        var run = StartProcessor(cts.Token);
+
+        await WriteValidAsync(1);
+        await WriteValidAsync(1, key: "OTHER-VEHICLE");
+        await WriteValidAsync(1, key: null); // no key: nothing to compare, accepted
+        _channel.Writer.Complete();
+        await run.WaitAsync(Timeout);
+
+        _dlq.Published.Should().ContainSingle().Which.Reason.Should().Be(DlqReasons.KeyMismatch);
+        _dlq.Published[0].Msg.Offset.Should().Be(1);
+        _committer.Calls.Should().ContainSingle().Which.Select(e => e.Seq).Should().Equal(0L, 2L);
+        _offsets.Stored.Should().Equal((Partition, 3L));
+        _log.Should().Equal("dlq:1", "commit:2", "offset:3");
+    }
+
     private Task StartProcessor(CancellationToken ct, IDedupeHint? hint = null, IProcessingObserver? observer = null)
     {
         var processor = new PartitionProcessor(Partition, _channel.Reader, _committer, hint ?? new NoopDedupeHint(), _dlq, _offsets,
@@ -414,7 +433,9 @@ public sealed class PartitionProcessorTests
         return Task.Run(() => processor.RunAsync(ct));
     }
 
-    private async Task WriteValidAsync(int count, ActivityContext parent = default)
+    private const string VehicleKey = "use-vehicle-id";
+
+    private async Task WriteValidAsync(int count, ActivityContext parent = default, string? key = VehicleKey)
     {
         for (var i = 0; i < count; i++)
         {
@@ -430,14 +451,15 @@ public sealed class PartitionProcessorTests
                 SpeedKmh = 50,
                 Ignition = true,
             };
-            await WriteAsync(JsonSerializer.SerializeToUtf8Bytes(dto, TelemetryJsonContext.Default.TelemetryEventDto), parent);
+            await WriteAsync(JsonSerializer.SerializeToUtf8Bytes(dto, TelemetryJsonContext.Default.TelemetryEventDto), parent,
+                key == VehicleKey ? dto.VehicleId : key);
         }
     }
 
-    private ValueTask WriteAsync(byte[]? value, ActivityContext parent = default)
+    private ValueTask WriteAsync(byte[]? value, ActivityContext parent = default, string? key = "k")
     {
         var offset = _nextOffset++;
-        return _channel.Writer.WriteAsync(new PartitionMessage(Partition, offset, "k", value, parent, _clock.GetUtcNow()));
+        return _channel.Writer.WriteAsync(new PartitionMessage(Partition, offset, key, value, parent, _clock.GetUtcNow()));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, Action? onEachPoll = null)

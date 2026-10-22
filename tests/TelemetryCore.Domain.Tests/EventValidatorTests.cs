@@ -163,4 +163,42 @@ public class EventValidatorTests
         Run(Json(ts: Ts(Now.AddMinutes(5)))).ok.Should().BeTrue();
         Run(Json(ts: Ts(Now.AddHours(-24)))).ok.Should().BeTrue();
     }
+
+    [Theory]
+    [InlineData("A\\u0000")]            // NUL byte: PostgreSQL text rejects it
+    [InlineData("VH 1")]
+    [InlineData("VH.1")]
+    [InlineData("VH/1")]
+    [InlineData("VH\\u00f1")]           // non-ASCII letter
+    [InlineData("VH1\\n")]              // trailing newline must not slip past "$"
+    public void VehicleIdWithBadCharacters_IsRejected(string jsonEscapedVehicleId)
+    {
+        var (ok, reason, _) = Run(Json(vehicleId: jsonEscapedVehicleId));
+        ok.Should().BeFalse();
+        reason.Should().Be(DlqReasons.InvalidVehicleId);
+    }
+
+    [Fact]
+    public void VehicleIdOf65Chars_IsRejected()
+    {
+        var (ok, reason, _) = Run(Json(vehicleId: new string('a', 65)));
+        ok.Should().BeFalse();
+        reason.Should().Be(DlqReasons.InvalidVehicleId);
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("VH_000-123")]
+    public void VehicleIdMatchingPattern_IsAccepted(string vehicleId)
+    {
+        var (ok, _, evt) = Run(Json(vehicleId: vehicleId));
+        ok.Should().BeTrue();
+        evt.VehicleId.Should().Be(vehicleId);
+    }
+
+    [Fact]
+    public void VehicleIdOf64Chars_IsAccepted()
+    {
+        Run(Json(vehicleId: new string('a', 64))).ok.Should().BeTrue();
+    }
 }

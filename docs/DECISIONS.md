@@ -100,3 +100,6 @@ A moving tag can change broker behavior between runs; the pinned version keeps t
 
 ### D28. Kubernetes shutdown budget, startup probe and KEDA ceiling
 `preStop` (2 s) plus the host's 25 s shutdown timeout fits in the 30 s `terminationGracePeriodSeconds`. A `startupProbe` protects slow starts from the liveness probe. KEDA `maxReplicaCount` is 12, equal to the partitions of `telemetry.raw`; more consumers would sit idle.
+
+### D29. Vehicle id format and Kafka key are validated before the batch
+`vehicleId` must match `^[A-Za-z0-9_-]{1,64}$` (shared with the Read API in `Contracts/VehicleIds`), otherwise the message goes to the DLQ as `invalid_vehicle_id`. A NUL byte or other free text would be rejected by PostgreSQL, the batch would be retried forever (D11) and the partition would stall. When the Kafka key is present and differs from the payload `vehicleId`, the message goes to the DLQ as `key_mismatch`, because the key decides the partition and one vehicle must not be split over two partitions. A missing key is accepted. `eventId` is a GUID and the other fields are numbers, so `vehicleId` is the only free-form text field.

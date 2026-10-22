@@ -1,5 +1,5 @@
 using System.Globalization;
-using System.Text.RegularExpressions;
+using TelemetryCore.Contracts;
 
 namespace TelemetryCore.ReadApi;
 
@@ -17,10 +17,7 @@ public static partial class QueryValidation
         "yyyy-MM-dd", "yyyy-MM-ddTHH:mmK", "yyyy-MM-ddTHH:mm:ssK", "yyyy-MM-ddTHH:mm:ss.FFFFFFFK",
     };
 
-    [GeneratedRegex("^[A-Za-z0-9_-]{1,64}$", RegexOptions.CultureInvariant)]
-    private static partial Regex VehicleIdPattern();
-
-    public static bool IsValidVehicleId(string? vehicleId) => vehicleId is not null && VehicleIdPattern().IsMatch(vehicleId);
+    public static bool IsValidVehicleId(string? vehicleId) => VehicleIds.IsValid(vehicleId);
 
     public static bool TryParseAlerts(IQueryCollection query, out AlertsQuery? result, out Dictionary<string, string[]> errors)
     {
@@ -33,7 +30,7 @@ public static partial class QueryValidation
             vehicleId = v.ToString();
             if (!IsValidVehicleId(vehicleId))
             {
-                errors["vehicleId"] = new[] { "vehicleId must match ^[A-Za-z0-9_-]{1,64}$." };
+                errors["vehicleId"] = new[] { $"vehicleId must match {VehicleIds.Pattern}." };
             }
         }
 
